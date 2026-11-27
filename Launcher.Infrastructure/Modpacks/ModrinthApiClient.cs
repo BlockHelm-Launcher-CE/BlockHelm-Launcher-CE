@@ -76,69 +76,49 @@ public sealed class ModrinthApiClient
         await using var admission = await hostConcurrencyController.AcquireAsync(
             uri,
             limiter.AcquireMetadataSlotAsync,
-            applyColdStartJitter: true,
             cancellationToken).ConfigureAwait(false);
         HttpResponseMessage? response = null;
-        DownloadFailureReason? failureReason = null;
-        HttpStatusCode? statusCode = null;
-        var recordResult = false;
         Dictionary<string, ModrinthVersionMatch> versions;
         try
         {
-            response = await httpClient.PostAsJsonAsync(
-                    uri,
+            response = await DownloadHttpDiagnostics.PostAsJsonAsync(httpClient, logger,
+                    uri.AbsoluteUri,
                     new ModrinthVersionFilesRequest(hashes, "sha1"),
                     JsonOptions,
                     cancellationToken)
                 .ConfigureAwait(false);
-            statusCode = response.StatusCode;
             response.EnsureSuccessStatusCode();
-            versions = await response.Content.ReadFromJsonAsync<Dictionary<string, ModrinthVersionMatch>>(
-                    JsonOptions,
-                    cancellationToken)
+            versions = await DownloadHttpDiagnostics.ReadFromJsonAsync<Dictionary<string, ModrinthVersionMatch>>(response, logger, cancellationToken, JsonOptions)
                 .ConfigureAwait(false)
                 ?? new Dictionary<string, ModrinthVersionMatch>(StringComparer.OrdinalIgnoreCase);
-            failureReason = null;
-            recordResult = true;
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             throw;
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException exception)
         {
-            failureReason = response is null
-                ? DownloadFailureReason.ResponseHeadersTimeout
-                : DownloadFailureReason.BodyInterrupted;
-            statusCode = response?.StatusCode;
-            recordResult = true;
+            logger.LogWarning(exception, "Download metadata request failed. Host={Host} StatusCode={StatusCode}", uri.Host, (int?)response?.StatusCode);
             throw;
         }
-        catch (HttpRequestException)
+        catch (HttpRequestException exception)
         {
-            failureReason = response is null
-                ? DownloadFailureReason.Network
-                : response.IsSuccessStatusCode
-                    ? DownloadFailureReason.BodyInterrupted
-                    : DownloadFailureReason.HttpStatus;
-            statusCode = response?.StatusCode;
-            recordResult = true;
+            logger.LogWarning(exception, "Download metadata request failed. Host={Host} StatusCode={StatusCode}", uri.Host, (int?)response?.StatusCode);
             throw;
         }
-        catch (IOException)
+        catch (IOException exception)
         {
-            failureReason = response is null
-                ? DownloadFailureReason.Network
-                : DownloadFailureReason.BodyInterrupted;
-            statusCode = response?.StatusCode;
-            recordResult = true;
+            logger.LogWarning(exception, "Download metadata request failed. Host={Host} StatusCode={StatusCode}", uri.Host, (int?)response?.StatusCode);
+            throw;
+        }
+        catch (Exception exception)
+        {
+            logger.LogWarning(exception, "Download metadata read or parse failed. Host={Host} StatusCode={StatusCode}", uri.Host, (int?)response?.StatusCode);
             throw;
         }
         finally
         {
             response?.Dispose();
-            if (recordResult)
-                RecordHostResult(admission.Origin, failureReason, statusCode);
         }
 
         var result = new Dictionary<string, ModrinthVersionFileMatch>(StringComparer.OrdinalIgnoreCase);
@@ -172,24 +152,6 @@ public sealed class ModrinthApiClient
             hashes.Length,
             result.Count);
         return result;
-    }
-
-    private void RecordHostResult(
-        string origin,
-        DownloadFailureReason? failureReason,
-        HttpStatusCode? statusCode)
-    {
-        var adjustment = hostConcurrencyController.RecordResult(origin, failureReason, statusCode);
-        if (adjustment is null)
-            return;
-        logger.LogDebug(
-            "Download host concurrency adjusted. HostOrigin={HostOrigin} PreviousTarget={PreviousTarget} CurrentTarget={CurrentTarget} AdjustmentReason={AdjustmentReason} SuccessCount={SuccessCount} FailureCount={FailureCount}",
-            adjustment.Origin,
-            adjustment.PreviousTarget,
-            adjustment.CurrentTarget,
-            adjustment.Reason,
-            adjustment.Successes,
-            adjustment.Failures);
     }
 
     internal sealed record ModrinthVersionFileMatch(

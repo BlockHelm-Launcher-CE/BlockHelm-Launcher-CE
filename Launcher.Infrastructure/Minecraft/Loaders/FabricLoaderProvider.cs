@@ -55,14 +55,15 @@ public sealed class FabricLoaderProvider : ILoaderProvider, ISeparatedInstallPat
         string minecraftVersion,
         DownloadSourcePreference downloadSourcePreference = LauncherDefaults.DefaultDownloadSourcePreference,
         CancellationToken cancellationToken = default,
-        int downloadSpeedLimitMbPerSecond = 0)
+        int downloadSpeedLimitMbPerSecond = 0,
+        bool interactive = false)
     {
         // 响应必须是非空数组且包含有效 loader.version，格式错误与没有结果使用不同诊断。
         var executor = new MinecraftDownloadRequestExecutor(
             httpClient,
             logger,
             DownloadBandwidthLimiter.Create(downloadSpeedLimitMbPerSecond, downloadSpeedLimitState),
-            category: DownloadConcurrencyCategory.Metadata);
+            category: interactive ? DownloadConcurrencyCategory.InteractiveVersionCatalog : DownloadConcurrencyCategory.Metadata);
         var result = await executor.ExecuteStaggeredLookupAsync(
             $"https://meta.fabricmc.net/v2/versions/loader/{minecraftVersion}",
             downloadSourcePreference,
@@ -73,8 +74,7 @@ public sealed class FabricLoaderProvider : ILoaderProvider, ISeparatedInstallPat
                 using var json = await JsonDocument.ParseAsync(stream, cancellationToken: token);
                 if (json.RootElement.ValueKind is not JsonValueKind.Array)
                 {
-                    throw new DownloadContentValidationException(
-                        "Fabric loader metadata is not a JSON array.");
+                    throw SafeExceptionLog.Describe(new DownloadContentValidationException("Fabric loader metadata is not a JSON array."), "DownloadContentValidationException", ("Reason", "Fabric loader metadata is not a JSON array."));
                 }
 
                 var entries = json.RootElement.EnumerateArray().ToList();
@@ -88,8 +88,7 @@ public sealed class FabricLoaderProvider : ILoaderProvider, ISeparatedInstallPat
                     .ToList();
                 if (versions.Count == 0)
                 {
-                    throw new DownloadContentValidationException(
-                        "Fabric loader metadata contains no valid loader entries.");
+                    throw SafeExceptionLog.Describe(new DownloadContentValidationException("Fabric loader metadata contains no valid loader entries."), "DownloadContentValidationException", ("Reason", "Fabric loader metadata contains no valid loader entries."));
                 }
 
                 return (IReadOnlyList<LoaderVersionInfo>)versions;
@@ -185,7 +184,8 @@ public sealed class FabricLoaderProvider : ILoaderProvider, ISeparatedInstallPat
                 downloadSpeedLimitMbPerSecond,
                 downloadSpeedLimitState,
                 downloadOperation,
-                speedMeter);
+                speedMeter,
+                runtimeHttpClient: httpClient);
             VanillaLoaderProvider.AttachProgress(launcher, progress);
             var finalVersionName = await ComposedVersionInstallRunner.RunAsync(
                 token => FabricVersionComposer.PrepareFinalVersionAsync(

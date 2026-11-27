@@ -40,6 +40,7 @@ internal sealed class DownloadSpeedTrackingGameInstaller : ParallelGameInstaller
     private readonly MinecraftPath? minecraftPath;
     private readonly MinecraftDownloadOperationContext? operationContext;
     private readonly ILogger? logger;
+    private readonly AssetInstallProgress? assetProgress;
 
     internal int ConfiguredMaxChecker { get; }
     internal int ConfiguredMaxDownloader { get; }
@@ -55,7 +56,8 @@ internal sealed class DownloadSpeedTrackingGameInstaller : ParallelGameInstaller
         MinecraftPath? minecraftPath,
         MinecraftDownloadOperationContext? operationContext,
         SpeedMeter? sharedSpeedMeter,
-        ILogger? logger)
+        ILogger? logger,
+        AssetInstallProgress? assetProgress)
         : base(maxChecker, maxDownloader, boundedCapacity, httpClient)
     {
         ConfiguredMaxChecker = maxChecker;
@@ -65,6 +67,7 @@ internal sealed class DownloadSpeedTrackingGameInstaller : ParallelGameInstaller
         this.minecraftPath = minecraftPath;
         this.operationContext = operationContext;
         this.logger = logger;
+        this.assetProgress = assetProgress;
         speedMeter = sharedSpeedMeter ?? SpeedMeterProgress.TryGet(progress);
     }
 
@@ -76,7 +79,8 @@ internal sealed class DownloadSpeedTrackingGameInstaller : ParallelGameInstaller
         MinecraftPath? minecraftPath = null,
         MinecraftDownloadOperationContext? operationContext = null,
         SpeedMeter? sharedSpeedMeter = null,
-        ILogger? logger = null)
+        ILogger? logger = null,
+        AssetInstallProgress? assetProgress = null)
     {
         var maxChecker = Environment.ProcessorCount;
         maxChecker = Math.Max(1, maxChecker);
@@ -93,7 +97,8 @@ internal sealed class DownloadSpeedTrackingGameInstaller : ParallelGameInstaller
             minecraftPath,
             operationContext,
             sharedSpeedMeter,
-            logger);
+            logger,
+            assetProgress);
     }
 
     protected override Task Download(
@@ -110,14 +115,15 @@ internal sealed class DownloadSpeedTrackingGameInstaller : ParallelGameInstaller
         CancellationToken cancellationToken)
     {
         var fileUrl = file.Url
-                ?? throw new InvalidDataException($"CmlLib game file URL is missing: {file.Name}");
+                ?? throw SafeExceptionLog.Describe(new InvalidDataException($"CmlLib game file URL is missing: {file.Name}"), "GameFileMetadataMissing", ("FileName", file.Name), ("Field", "url"));
         var filePath = file.Path
-                ?? throw new InvalidDataException($"CmlLib game file path is missing: {file.Name}");
+                ?? throw SafeExceptionLog.Describe(new InvalidDataException($"CmlLib game file path is missing: {file.Name}"), "GameFileMetadataMissing", ("FileName", file.Name), ("Field", "path"));
         if (minecraftPath is not null)
             filePath = MinecraftPathGuard.EnsureInstallFilePath(minecraftPath, filePath);
         long? expectedSize = file.Size > 0 ? file.Size : null;
-        var options = operationContext?.TryGetAsset(filePath, file.Hash, expectedSize) is true
-            ? new DownloadFileOptions(DownloadPersistenceMode.LightweightAtomic, operationContext)
+        var isAsset = operationContext?.TryGetAsset(filePath, file.Hash, expectedSize) is true;
+        var options = isAsset
+            ? DownloadFileOptions.ForAsset(operationContext, expectedSize)
             : operationContext is not null && MinecraftFileIntegrity.IsSha1(file.Hash)
                 ? new DownloadFileOptions(DownloadPersistenceMode.TaskScopedResumable, operationContext)
                 : null;
@@ -129,9 +135,12 @@ internal sealed class DownloadSpeedTrackingGameInstaller : ParallelGameInstaller
             file.Name,
             filePath,
             fileUrl,
-            expectedSize);
+            expectedSize,
+            logStart: !isAsset || expectedSize >= MinecraftDownloadRequestExecutor.MinimumSegmentedDownloadSize);
+        using var diagnosticLogScope = logScope.RestoreContext();
         var reportProgress = logScope.BeginSource((attempt, progressedBytes, totalBytes) =>
         {
+            assetProgress?.ReportTransfer(file, attempt, progressedBytes);
             if (attempt != currentAttempt)
             {
                 currentAttempt = attempt;
@@ -144,6 +153,11 @@ internal sealed class DownloadSpeedTrackingGameInstaller : ParallelGameInstaller
         });
         try
         {
+            if (await TryReuseVanillaClientAsync(filePath, file.Hash, expectedSize, cancellationToken).ConfigureAwait(false))
+            {
+                logScope.CompleteWithoutDownload("ReusedVanillaClient", fileUrl);
+                return;
+            }
             var resolution = await downloadExecutor.DownloadFileAsync(
                 fileUrl,
                 downloadSourcePreference,
@@ -167,6 +181,30 @@ internal sealed class DownloadSpeedTrackingGameInstaller : ParallelGameInstaller
         {
             logScope.Fail(exception, fileUrl);
             throw;
+        }
+    }
+
+    private async Task<bool> TryReuseVanillaClientAsync(
+        string destination, string? expectedSha1, long? size, CancellationToken token)
+    {
+        if (operationContext?.ReusableVanillaClient is not { } client || minecraftPath is null
+            || !string.Equals(client.Sha1, expectedSha1, StringComparison.OrdinalIgnoreCase) || client.Size != size
+            || !string.Equals(Path.GetExtension(destination), ".jar", StringComparison.OrdinalIgnoreCase)
+            || !MinecraftPathGuard.IsWithin(destination, minecraftPath.Versions)
+            || !File.Exists(client.Path) || File.Exists(destination))
+            return false;
+
+        try
+        {
+            await AtomicSharedFilePublisher.PublishCopyAsync(client.Path, destination, client.Sha1,
+                token, operationContext.ResolveManagedRoot(destination), logger).ConfigureAwait(false);
+            logger?.LogDebug("Reused a verified vanilla client JAR. ExpectedBytes={ExpectedBytes}", client.Size);
+            return true;
+        }
+        catch (Exception exception) when (exception is IOException or InvalidDataException)
+        {
+            logger?.LogDebug(exception, "Vanilla client reuse failed; downloading the version JAR.");
+            return false;
         }
     }
 

@@ -11,17 +11,197 @@
 
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Net;
+using System.Security.Cryptography;
 using Launcher.Application;
 using Launcher.Application.Services;
 using Launcher.Domain.Models;
 using Launcher.Infrastructure.Minecraft;
 using Launcher.Infrastructure.Modpacks;
+using Launcher.Infrastructure.Modrinth;
 using Launcher.Infrastructure.Persistence;
+using Microsoft.Extensions.Logging;
 
 namespace Launcher.Tests.Services;
 
 public sealed class GameInstanceServiceTests : TestTempDirectory
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task FabricApiAndBaseGamePrepareTogetherBeforeInstanceCommit(bool apiFails)
+    {
+        var settings = CreateSettings();
+        var settingsService = new TestSettingsService(settings);
+        var repository = new JsonGameInstanceRepository(settingsService);
+        var releaseGame = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseApi = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var provider = new FakeLoaderProvider { Kind = LoaderKind.Fabric, WaitBeforeInstall = releaseGame.Task };
+        using var handler = new FabricApiPreparationHandler(releaseApi.Task, apiFails);
+        using var client = new HttpClient(handler);
+        var service = new GameInstanceService(settingsService, repository, [provider], new ModrinthService(client),
+            new ModpackGameInstaller([provider]), installTransactionService: new InstanceInstallTransactionService());
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+        var install = service.CreateInstanceAsync("1.21.1", LoaderKind.Fabric, "test", "Fabric Test", null,
+            cancellationToken: timeout.Token, installFabricApi: true, fabricApiVersionId: "test-api");
+        var versions = Path.Combine(settings.MinecraftDirectory, "versions");
+        var published = Path.Combine(versions, "Fabric Test");
+        try
+        {
+            await Task.WhenAll(provider.InstallStarted.Task, handler.ApiStarted.Task).WaitAsync(timeout.Token);
+            Assert.False(Directory.Exists(published));
+            releaseApi.TrySetResult();
+            if (apiFails)
+            {
+                var failure = await Assert.ThrowsAsync<HttpRequestException>(() => install);
+                Assert.Equal(HttpStatusCode.NotFound, failure.StatusCode);
+                Assert.Empty(Directory.GetDirectories(versions));
+                Assert.Empty(await repository.GetAllAsync());
+            }
+            else
+            {
+                await handler.FileRequested.Task.WaitAsync(timeout.Token);
+                Assert.False(Directory.Exists(published));
+                releaseGame.TrySetResult();
+                var instance = await install;
+                Assert.Equal("test API", await File.ReadAllTextAsync(Path.Combine(instance.InstanceDirectory, "mods", "fabric-api.jar"), timeout.Token));
+            }
+        }
+        finally
+        {
+            releaseGame.TrySetResult();
+            releaseApi.TrySetResult();
+            await timeout.CancelAsync();
+            await Task.WhenAny(install);
+        }
+    }
+
+    private sealed class FabricApiPreparationHandler(Task releaseApi, bool apiFails) : HttpMessageHandler
+    {
+        public TaskCompletionSource ApiStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource FileRequested { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            if (request.RequestUri!.Host == "cdn.example.invalid")
+            {
+                FileRequested.TrySetResult();
+                return new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("test API") };
+            }
+
+            Assert.EndsWith("/version/test-api", request.RequestUri.AbsolutePath);
+            ApiStarted.TrySetResult();
+            await releaseApi.WaitAsync(cancellationToken);
+            if (apiFails)
+                return new HttpResponseMessage(HttpStatusCode.NotFound);
+
+            var sha512 = Convert.ToHexString(SHA512.HashData("test API"u8));
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent($$$"""
+                    {"id":"test-api","project_id":"fabric-api","version_number":"1.0","files":[
+                      {"filename":"fabric-api.jar","url":"https://cdn.example.invalid/fabric-api.jar",
+                       "primary":true,"size":8,"hashes":{"sha512":"{{{sha512}}}"}}]}
+                    """)
+            };
+        }
+    }
+
+    [Fact]
+    public async Task SelectingInstanceDoesNotScanUnrelatedVersionsAndRejectsRemovedTarget()
+    {
+        var settings = CreateSettings();
+        var settingsService = new TestSettingsService(settings);
+        await CreateVersionAsync(settings.MinecraftDirectory, "selected", type: "release");
+        await CreateVersionAsync(settings.MinecraftDirectory, "unrelated", type: "release");
+        var selected = Path.Combine(settings.MinecraftDirectory, "versions", "selected");
+        var unrelatedJson = Path.Combine(settings.MinecraftDirectory, "versions", "unrelated", "unrelated.json");
+        var repository = new JsonGameInstanceRepository(settingsService);
+        var service = new GameInstanceService(settingsService, repository, []);
+        await using (var held = new FileStream(unrelatedJson, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+        {
+            Assert.True(await service.SetDefaultInstanceAsync(selected));
+            Assert.Equal(selected, settings.DefaultInstanceDirectory);
+        }
+        Directory.Move(selected, Path.Combine(TempRoot, "moved"));
+        Assert.False(await service.SetDefaultInstanceAsync(selected));
+        Assert.False(Directory.Exists(selected));
+    }
+
+    [Fact]
+    public async Task CatalogReadCannotObserveATemporarySwapAndResetDefault()
+    {
+        var settings = CreateSettings("selected");
+        var settingsService = new TestSettingsService(settings);
+        var repository = new JsonGameInstanceRepository(settingsService);
+        await CreateVersionAsync(settings.MinecraftDirectory, "selected", type: "release");
+        await CreateVersionAsync(settings.MinecraftDirectory, "0-other", type: "release");
+        var selected = CreateStoredInstance("selected");
+        selected.MemoryMb = 6144;
+        await repository.SaveAllAsync(settings.MinecraftDirectory, [selected]);
+        var blocked = false;
+        var loads = 0;
+        settingsService.BeforeLoad = () =>
+        {
+            if (Interlocked.Increment(ref loads) != 2) return;
+            using var mutationLock = CrossProcessVersionLock.TryAcquire(CrossProcessVersionLock.GetMutationPath(settings.MinecraftDirectory));
+            if (mutationLock is null) { blocked = true; return; }
+            Directory.Move(selected.InstanceDirectory, Path.Combine(TempRoot, "active-swap"));
+        };
+        var service = new GameInstanceService(settingsService, repository, []);
+
+        var instances = await service.GetInstancesAsync();
+
+        Assert.Equal(selected.InstanceDirectory, settings.DefaultInstanceDirectory);
+        Assert.True(blocked);
+        Assert.Equal(6144, Assert.Single(instances.Where(instance => instance.VersionName == "selected")).MemoryMb);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task DirectoryChangeDuringDiscoveryExcludesTheMixedInstance(bool replace)
+    {
+        var settings = CreateSettings("selected");
+        var settingsService = new TestSettingsService(settings);
+        var directory = Path.Combine(settings.MinecraftDirectory, "versions", "selected");
+        await CreateVersionAsync(settings.MinecraftDirectory, "selected", type: "release");
+        await CreateVersionAsync(settings.MinecraftDirectory, "other", type: "release");
+        var changed = false;
+        var logger = new DiscoveryCallbackLogger(() =>
+        {
+            if (changed) return;
+            changed = true;
+            Directory.Move(directory, Path.Combine(TempRoot, "moved"));
+            if (replace)
+            {
+                Directory.CreateDirectory(directory);
+                File.Copy(Path.Combine(TempRoot, "moved", "selected.json"), Path.Combine(directory, "selected.json"));
+                File.WriteAllText(Path.Combine(directory, "keep.txt"), "replacement");
+            }
+        });
+        var service = new GameInstanceService(settingsService, new JsonGameInstanceRepository(settingsService, logger), []);
+
+        var instances = await service.GetInstancesAsync();
+
+        Assert.True(changed);
+        Assert.Equal("other", Assert.Single(instances).VersionName);
+        Assert.Equal(directory, settings.DefaultInstanceDirectory);
+        Assert.Equal(replace, Directory.Exists(directory));
+        if (replace) Assert.Equal("replacement", await File.ReadAllTextAsync(Path.Combine(directory, "keep.txt")));
+    }
+
+    private sealed class DiscoveryCallbackLogger(Action callback) : ILogger<JsonGameInstanceRepository>
+    {
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(LogLevel logLevel) => true;
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+        {
+            if (state is IEnumerable<KeyValuePair<string, object?>> properties && properties.Any(property => property.Key == "VersionCount"))
+                callback();
+        }
+    }
+
     [Fact]
     public async Task CreateInstanceCreatesIsolatedDirectories()
     {
@@ -90,11 +270,11 @@ public sealed class GameInstanceServiceTests : TestTempDirectory
         await CreateVersionAsync(settings.MinecraftDirectory, "first");
         await repository.SaveAllAsync([CreateStoredInstance("first")]);
 
-        await Assert.ThrowsAsync<IOException>(() => service.DeleteInstanceAsync("first"));
+        await Assert.ThrowsAsync<IOException>(() => service.DeleteInstanceAsync(Path.Combine(settings.MinecraftDirectory, "versions", "first")));
 
         Assert.True(Directory.Exists(Path.Combine(settings.MinecraftDirectory, "versions", "first")));
         Assert.Single(await repository.GetAllAsync());
-        Assert.Equal("first", (await settingsService.LoadAsync()).DefaultInstanceId);
+        Assert.Equal(Path.Combine(settings.MinecraftDirectory, "versions", "first"), (await settingsService.LoadAsync()).DefaultInstanceDirectory);
     }
 
     [Fact]
@@ -114,7 +294,7 @@ public sealed class GameInstanceServiceTests : TestTempDirectory
         await CreateVersionAsync(settings.MinecraftDirectory, "first");
         await repository.SaveAllAsync([CreateStoredInstance("first")]);
 
-        Assert.True(await service.DeleteInstanceAsync("first"));
+        Assert.True(await service.DeleteInstanceAsync(Path.Combine(settings.MinecraftDirectory, "versions", "first")));
 
         var versionsDirectory = Path.Combine(settings.MinecraftDirectory, "versions");
         Assert.False(Directory.Exists(Path.Combine(versionsDirectory, "first")));
@@ -123,7 +303,7 @@ public sealed class GameInstanceServiceTests : TestTempDirectory
         Assert.True(File.Exists(Path.Combine(pendingDirectory, ".bhl-delete-pending-.json")));
         Assert.Empty(await repository.GetAllAsync());
         Assert.Empty(await service.GetInstancesAsync());
-        Assert.Equal(string.Empty, (await settingsService.LoadAsync()).DefaultInstanceId);
+        Assert.Equal(string.Empty, (await settingsService.LoadAsync()).DefaultInstanceDirectory);
     }
 
     [Fact]
@@ -153,9 +333,9 @@ public sealed class GameInstanceServiceTests : TestTempDirectory
         await CreateVersionAsync(settings.MinecraftDirectory, "first");
         await repository.SaveAllAsync([CreateStoredInstance("first")]);
 
-        var firstDelete = service.DeleteInstanceAsync("first");
+        var firstDelete = service.DeleteInstanceAsync(Path.Combine(settings.MinecraftDirectory, "versions", "first"));
         await moveStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
-        var duplicateResult = await service.DeleteInstanceAsync("first");
+        var duplicateResult = await service.DeleteInstanceAsync(Path.Combine(settings.MinecraftDirectory, "versions", "first"));
         allowMove.Set();
 
         Assert.False(duplicateResult);
@@ -195,7 +375,7 @@ public sealed class GameInstanceServiceTests : TestTempDirectory
     {
         DataDirectory = TempRoot,
         MinecraftDirectory = Path.Combine(TempRoot, ".minecraft"),
-        DefaultInstanceId = defaultInstanceId ?? string.Empty
+        DefaultInstanceDirectory = defaultInstanceId is null ? string.Empty : Path.Combine(TempRoot, ".minecraft", "versions", defaultInstanceId)
     };
 
     private static async Task CreateVersionAsync(
@@ -218,12 +398,12 @@ public sealed class GameInstanceServiceTests : TestTempDirectory
             await File.WriteAllTextAsync(Path.Combine(directory, $"{versionName}.jar"), "fake jar");
     }
 
-    private static GameInstance CreateStoredInstance(string name) => new()
+    private GameInstance CreateStoredInstance(string name) => new()
     {
-        Id = name,
+
         Name = name,
         MinecraftVersion = "1.20.1",
         VersionName = name,
-        InstanceDirectory = string.Empty
+        InstanceDirectory = Path.Combine(TempRoot, ".minecraft", "versions", name)
     };
 }

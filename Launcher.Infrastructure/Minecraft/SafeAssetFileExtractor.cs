@@ -26,19 +26,22 @@ internal sealed class SafeAssetFileExtractor : IFileExtractor
     private readonly MinecraftDownloadOperationContext? operationContext;
     private readonly SpeedMeter? speedMeter;
     private readonly ILogger? logger;
+    private readonly AssetInstallProgress? assetProgress;
 
     public SafeAssetFileExtractor(
         MinecraftDownloadRequestExecutor downloadExecutor,
         DownloadSourcePreference downloadSourcePreference,
         MinecraftDownloadOperationContext? operationContext,
         SpeedMeter? speedMeter = null,
-        ILogger? logger = null)
+        ILogger? logger = null,
+        AssetInstallProgress? assetProgress = null)
     {
         this.downloadExecutor = downloadExecutor;
         this.downloadSourcePreference = downloadSourcePreference;
         this.operationContext = operationContext;
         this.speedMeter = speedMeter;
         this.logger = logger;
+        this.assetProgress = assetProgress;
     }
 
     public async ValueTask<IEnumerable<GameFile>> Extract(
@@ -84,6 +87,7 @@ internal sealed class SafeAssetFileExtractor : IFileExtractor
                 indexPath,
                 metadata.Url,
                 metadata.Size > 0 ? metadata.Size : null);
+            using var diagnosticLogScope = logScope.RestoreContext();
             try
             {
                 var resolution = await downloadExecutor.DownloadFileAsync(
@@ -141,7 +145,7 @@ internal sealed class SafeAssetFileExtractor : IFileExtractor
                             path.Assets,
                             "Virtual asset"),
                         item.Hash,
-                        path.Assets));
+                        path.Assets, logger));
                 }
                 if (assetIndex.MapToResources)
                 {
@@ -151,10 +155,13 @@ internal sealed class SafeAssetFileExtractor : IFileExtractor
                             path.Resource,
                             "Legacy resource"),
                         item.Hash,
-                        path.Resource));
+                        path.Resource, logger));
                 }
 
-                yield return new GameFile(item.Name)
+                if (assetProgress is not null)
+                    updateTasks.Add(assetProgress);
+
+                var file = new GameFile(item.Name)
                 {
                     Path = objectPath,
                     Hash = item.Hash,
@@ -162,6 +169,8 @@ internal sealed class SafeAssetFileExtractor : IFileExtractor
                     Url = $"https://resources.download.minecraft.net/{relativeObjectPath}",
                     UpdateTask = updateTasks
                 };
+                assetProgress?.Register(file);
+                yield return file;
             }
         }
         finally
@@ -174,19 +183,19 @@ internal sealed class SafeAssetFileExtractor : IFileExtractor
     private sealed class AtomicAssetCopyTask(
         string destinationPath,
         string expectedSha1,
-        string managedRoot) : IUpdateTask
+        string managedRoot, ILogger? logger) : IUpdateTask
     {
         public async ValueTask Execute(GameFile file, CancellationToken cancellationToken)
         {
             if (string.IsNullOrWhiteSpace(file.Path))
-                throw new InvalidDataException("Asset object path is missing.");
+                throw SafeExceptionLog.Describe(new InvalidDataException("Asset object path is missing."), "DownloadValidation", ("Reason", "Asset object path is missing."));
 
             await AtomicSharedFilePublisher.PublishVerifiedReplacementAsync(
                 file.Path,
                 destinationPath,
                 expectedSha1,
                 cancellationToken,
-                managedRoot).ConfigureAwait(false);
+                managedRoot, logger).ConfigureAwait(false);
         }
     }
 }

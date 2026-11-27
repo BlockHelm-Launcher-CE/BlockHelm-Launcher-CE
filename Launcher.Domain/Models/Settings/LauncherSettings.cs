@@ -45,6 +45,7 @@ public sealed class LauncherSettings
     public Dictionary<string, string> MinecraftDirectoryDisplayNames { get; set; } = [];
     public List<string> ExcludedMinecraftDirectories { get; set; } = [];
     public DownloadSourcePreference DownloadSourcePreference { get; set; } = LauncherDefaults.DefaultDownloadSourcePreference;
+    public int DownloadSourceSelectionVersion { get; set; } = 1;
     public int MaximumDownloadConcurrency { get; set; } = LauncherDefaults.DefaultMaximumDownloadConcurrency;
     public int DownloadSpeedLimitMbPerSecond { get; set; }
     public MemorySettingsMode DefaultMemorySettingsMode { get; set; } = MemorySettingsMode.Auto;
@@ -61,5 +62,5 @@ public sealed class LauncherSettings
     public string DefaultPostExitCommand { get; set; } = string.Empty;
     public string DefaultJvmArguments { get; set; } = string.Empty;
     public string DefaultGameArguments { get; set; } = string.Empty;
-    public string? DefaultInstanceId { get; set; }
+    public string? DefaultInstanceDirectory { get; set; }
 }

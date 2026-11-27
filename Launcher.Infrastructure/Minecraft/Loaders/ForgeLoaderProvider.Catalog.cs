@@ -40,9 +40,11 @@ private async Task<IReadOnlyDictionary<string, ForgeCatalogEntry>> GetCatalogAsy
         string minecraftVersion,
         DownloadSourcePreference downloadSourcePreference,
         CancellationToken cancellationToken,
-        int downloadSpeedLimitMbPerSecond = 0)
+        int downloadSpeedLimitMbPerSecond = 0,
+        bool interactive = false)
     {
-        await catalogLock.WaitAsync(cancellationToken);
+        if (!interactive)
+            await catalogLock.WaitAsync(cancellationToken);
         try
         {
             var cacheKey = $"{downloadSourcePreference}:{minecraftVersion}";
@@ -53,7 +55,7 @@ private async Task<IReadOnlyDictionary<string, ForgeCatalogEntry>> GetCatalogAsy
                 httpClient,
                 logger,
                 DownloadBandwidthLimiter.Create(downloadSpeedLimitMbPerSecond, downloadSpeedLimitState),
-                category: DownloadConcurrencyCategory.Metadata);
+                category: interactive ? DownloadConcurrencyCategory.InteractiveVersionCatalog : DownloadConcurrencyCategory.Metadata);
             var result = await executor.ExecuteStaggeredLookupAsync(
                 GetForgeIndexUrl(minecraftVersion),
                 downloadSourcePreference,
@@ -67,15 +69,13 @@ private async Task<IReadOnlyDictionary<string, ForgeCatalogEntry>> GetCatalogAsy
                         using var document = await JsonDocument.ParseAsync(stream, cancellationToken: token);
                         if (document.RootElement.ValueKind is not JsonValueKind.Array)
                         {
-                            throw new DownloadContentValidationException(
-                                "BMCLAPI Forge catalog is not a JSON array.");
+                            throw SafeExceptionLog.Describe(new DownloadContentValidationException("BMCLAPI Forge catalog is not a JSON array."), "DownloadContentValidationException", ("Reason", "BMCLAPI Forge catalog is not a JSON array."));
                         }
 
                         entries = ParseBmclCatalogEntries(minecraftVersion, document.RootElement);
                         if (document.RootElement.GetArrayLength() > 0 && entries.Count == 0)
                         {
-                            throw new DownloadContentValidationException(
-                                "BMCLAPI Forge catalog contains no valid loader entries.");
+                            throw SafeExceptionLog.Describe(new DownloadContentValidationException("BMCLAPI Forge catalog contains no valid loader entries."), "DownloadContentValidationException", ("Reason", "BMCLAPI Forge catalog contains no valid loader entries."));
                         }
                     }
                     else
@@ -84,8 +84,7 @@ private async Task<IReadOnlyDictionary<string, ForgeCatalogEntry>> GetCatalogAsy
                         if (!html.Contains("<html", StringComparison.OrdinalIgnoreCase)
                             && !html.Contains("<!doctype", StringComparison.OrdinalIgnoreCase))
                         {
-                            throw new DownloadContentValidationException(
-                                "Forge catalog response is not an HTML document.");
+                            throw SafeExceptionLog.Describe(new DownloadContentValidationException("Forge catalog response is not an HTML document."), "DownloadContentValidationException", ("Reason", "Forge catalog response is not an HTML document."));
                         }
 
                         entries = ParseCatalogEntries(minecraftVersion, html);
@@ -98,12 +97,17 @@ private async Task<IReadOnlyDictionary<string, ForgeCatalogEntry>> GetCatalogAsy
                 },
                 statusCode => statusCode is HttpStatusCode.NotFound or HttpStatusCode.BadRequest,
                 cancellationToken);
-            catalogCache[cacheKey] = result.Found ? result.Value! : EmptyCatalog();
-            return catalogCache[cacheKey];
+            if (!result.Found)
+                return catalogCache.TryGetValue(cacheKey, out var concurrentResult) ? concurrentResult : EmptyCatalog();
+
+            var catalog = result.Value!;
+            catalogCache[cacheKey] = catalog;
+            return catalog;
         }
         finally
         {
-            catalogLock.Release();
+            if (!interactive)
+                catalogLock.Release();
         }
     }
 

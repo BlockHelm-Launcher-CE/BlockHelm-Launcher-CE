@@ -138,8 +138,9 @@ internal static class QuiltVersionComposer
             httpClient,
             logger,
             DownloadBandwidthLimiter.Create(downloadSpeedLimitMbPerSecond, downloadSpeedLimitState),
-            category: DownloadConcurrencyCategory.Metadata);
-        return await executor.ExecuteAsync(
+            category: DownloadConcurrencyCategory.Metadata,
+            retryOptions: DownloadRetryOptions.InteractiveMetadata);
+        var result = await executor.ExecuteStaggeredLookupAsync(
             profileUrl,
             downloadSourcePreference,
             categoryHint: "Quilt",
@@ -149,13 +150,16 @@ internal static class QuiltVersionComposer
                 var profileNode = await JsonNode.ParseAsync(profileStream, cancellationToken: token);
                 if (profileNode is not JsonObject profileObject)
                 {
-                    throw new DownloadContentValidationException(
-                        $"Quilt profile metadata is not a JSON object: {minecraftVersion} {loaderVersion}");
+                    throw SafeExceptionLog.Describe(new DownloadContentValidationException(
+                        $"Quilt profile metadata is not a JSON object: {minecraftVersion} {loaderVersion}"), "LoaderProfileRootInvalid",
+                        ("ExpectedFormat", "JSON object"), ("MinecraftVersion", minecraftVersion), ("LoaderVersion", loaderVersion), ("Loader", "Quilt"));
                 }
 
                 return profileObject;
             },
+            static _ => false,
             cancellationToken);
+        return result.Value!;
     }
 
 }

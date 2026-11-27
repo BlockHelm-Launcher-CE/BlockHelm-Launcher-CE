@@ -234,7 +234,7 @@ public sealed class CurseForgeApiClient
                 && IsTransientMetadataFailure(exception, cancellationToken))
             {
                 var delay = GetMetadataRetryDelay(exception, attempt);
-                logger.LogDebug(
+                logger.LogWarning(
                     exception,
                     "CurseForge metadata request will be retried. Attempt={Attempt} MaxAttempts={MaxAttempts} DelayMs={DelayMs}",
                     attempt,
@@ -244,7 +244,7 @@ public sealed class CurseForgeApiClient
             }
         }
 
-        throw new InvalidOperationException("CurseForge metadata retry loop completed without a result.");
+        throw SafeExceptionLog.Describe(new InvalidOperationException("CurseForge metadata retry loop completed without a result."), "DownloadValidation", ("Reason", "CurseForge metadata retry loop completed without a result."));
     }
 
     private async Task<T> SendMetadataAttemptAsync<T>(
@@ -252,20 +252,15 @@ public sealed class CurseForgeApiClient
         Func<HttpResponseMessage, CancellationToken, Task<T>> readAsync,
         CancellationToken cancellationToken)
     {
-        var uri = request.RequestUri ?? throw new InvalidOperationException("CurseForge request URI is missing.");
+        var uri = request.RequestUri ?? throw SafeExceptionLog.Describe(new InvalidOperationException("CurseForge request URI is missing."), "DownloadValidation", ("Reason", "CurseForge request URI is missing."));
         await using var admission = await hostConcurrencyController.AcquireAsync(
             uri,
             limiter.AcquireMetadataSlotAsync,
-            applyColdStartJitter: true,
             cancellationToken).ConfigureAwait(false);
         HttpResponseMessage? response = null;
-        DownloadFailureReason? failureReason = null;
-        HttpStatusCode? statusCode = null;
-        var recordResult = false;
         try
         {
-            response = await httpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
-            statusCode = response.StatusCode;
+            response = await DownloadHttpDiagnostics.SendAsync(httpClient, request, logger, cancellationToken).ConfigureAwait(false);
             if (IsTransientMetadataStatus(response.StatusCode))
             {
                 throw new CurseForgeMetadataTransientException(
@@ -273,48 +268,35 @@ public sealed class CurseForgeApiClient
                     ParseRetryAfter(response));
             }
             var result = await readAsync(response, cancellationToken).ConfigureAwait(false);
-            failureReason = response.IsSuccessStatusCode ? null : DownloadFailureReason.HttpStatus;
-            recordResult = true;
             return result;
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             throw;
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException exception)
         {
-            failureReason = response is null
-                ? DownloadFailureReason.ResponseHeadersTimeout
-                : DownloadFailureReason.BodyInterrupted;
-            statusCode = response?.StatusCode;
-            recordResult = true;
+            logger.LogWarning(exception, "Download metadata request failed. Host={Host} StatusCode={StatusCode}", uri.Host, (int?)response?.StatusCode);
             throw;
         }
-        catch (HttpRequestException)
+        catch (HttpRequestException exception)
         {
-            failureReason = response is null
-                ? DownloadFailureReason.Network
-                : response.IsSuccessStatusCode
-                    ? DownloadFailureReason.BodyInterrupted
-                    : DownloadFailureReason.HttpStatus;
-            statusCode = response?.StatusCode;
-            recordResult = true;
+            logger.LogWarning(exception, "Download metadata request failed. Host={Host} StatusCode={StatusCode}", uri.Host, (int?)response?.StatusCode);
             throw;
         }
-        catch (IOException)
+        catch (IOException exception)
         {
-            failureReason = response is null
-                ? DownloadFailureReason.Network
-                : DownloadFailureReason.BodyInterrupted;
-            statusCode = response?.StatusCode;
-            recordResult = true;
+            logger.LogWarning(exception, "Download metadata request failed. Host={Host} StatusCode={StatusCode}", uri.Host, (int?)response?.StatusCode);
+            throw;
+        }
+        catch (Exception exception)
+        {
+            logger.LogWarning(exception, "Download metadata read or parse failed. Host={Host} StatusCode={StatusCode}", uri.Host, (int?)response?.StatusCode);
             throw;
         }
         finally
         {
             response?.Dispose();
-            if (recordResult)
-                RecordHostResult(admission.Origin, failureReason, statusCode);
         }
     }
 
@@ -353,24 +335,6 @@ public sealed class CurseForgeApiClient
             return null;
         var delay = date - DateTimeOffset.UtcNow;
         return delay > TimeSpan.Zero ? delay : TimeSpan.Zero;
-    }
-
-    private void RecordHostResult(
-        string origin,
-        DownloadFailureReason? failureReason,
-        HttpStatusCode? statusCode)
-    {
-        var adjustment = hostConcurrencyController.RecordResult(origin, failureReason, statusCode);
-        if (adjustment is null)
-            return;
-        logger.LogDebug(
-            "Download host concurrency adjusted. HostOrigin={HostOrigin} PreviousTarget={PreviousTarget} CurrentTarget={CurrentTarget} AdjustmentReason={AdjustmentReason} SuccessCount={SuccessCount} FailureCount={FailureCount}",
-            adjustment.Origin,
-            adjustment.PreviousTarget,
-            adjustment.CurrentTarget,
-            adjustment.Reason,
-            adjustment.Successes,
-            adjustment.Failures);
     }
 
     private static HttpRequestMessage CreateRequest(string requestUri, string apiKey)

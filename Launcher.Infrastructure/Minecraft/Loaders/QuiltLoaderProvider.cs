@@ -54,7 +54,8 @@ public sealed class QuiltLoaderProvider : ILoaderProvider, ISeparatedInstallPath
         string minecraftVersion,
         DownloadSourcePreference downloadSourcePreference = LauncherDefaults.DefaultDownloadSourcePreference,
         CancellationToken cancellationToken = default,
-        int downloadSpeedLimitMbPerSecond = 0)
+        int downloadSpeedLimitMbPerSecond = 0,
+        bool interactive = false)
     {
         logger.LogDebug(
             "Loading Quilt versions. MinecraftVersion={MinecraftVersion}",
@@ -64,7 +65,7 @@ public sealed class QuiltLoaderProvider : ILoaderProvider, ISeparatedInstallPath
             httpClient,
             logger,
             DownloadBandwidthLimiter.Create(downloadSpeedLimitMbPerSecond, downloadSpeedLimitState),
-            category: DownloadConcurrencyCategory.Metadata);
+            category: interactive ? DownloadConcurrencyCategory.InteractiveVersionCatalog : DownloadConcurrencyCategory.Metadata);
         var result = await executor.ExecuteStaggeredLookupAsync(
             $"https://meta.quiltmc.org/v3/versions/loader/{minecraftVersion}",
             downloadSourcePreference,
@@ -75,8 +76,7 @@ public sealed class QuiltLoaderProvider : ILoaderProvider, ISeparatedInstallPath
                 using var json = await JsonDocument.ParseAsync(stream, cancellationToken: token);
                 if (json.RootElement.ValueKind is not JsonValueKind.Array)
                 {
-                    throw new DownloadContentValidationException(
-                        "Quilt loader metadata is not a JSON array.");
+                    throw SafeExceptionLog.Describe(new DownloadContentValidationException("Quilt loader metadata is not a JSON array."), "DownloadContentValidationException", ("Reason", "Quilt loader metadata is not a JSON array."));
                 }
 
                 var entries = json.RootElement.EnumerateArray().ToList();
@@ -95,8 +95,7 @@ public sealed class QuiltLoaderProvider : ILoaderProvider, ISeparatedInstallPath
                     .ToList();
                 if (versions.Count == 0)
                 {
-                    throw new DownloadContentValidationException(
-                        "Quilt loader metadata contains no valid loader entries.");
+                    throw SafeExceptionLog.Describe(new DownloadContentValidationException("Quilt loader metadata contains no valid loader entries."), "DownloadContentValidationException", ("Reason", "Quilt loader metadata contains no valid loader entries."));
                 }
 
                 return (IReadOnlyList<LoaderVersionInfo>)versions;
@@ -202,7 +201,8 @@ public sealed class QuiltLoaderProvider : ILoaderProvider, ISeparatedInstallPath
                 downloadSpeedLimitMbPerSecond,
                 downloadSpeedLimitState,
                 downloadOperation,
-                speedMeter);
+                speedMeter,
+                runtimeHttpClient: httpClient);
             VanillaLoaderProvider.AttachProgress(launcher, progress);
             var finalVersionName = await ComposedVersionInstallRunner.RunAsync(
                 token => QuiltVersionComposer.PrepareFinalVersionAsync(
@@ -218,6 +218,7 @@ public sealed class QuiltLoaderProvider : ILoaderProvider, ISeparatedInstallPath
                     token),
                 async (versionName, token) => await launcher.InstallAsync(versionName, token).ConfigureAwait(false),
                 cancellationToken).ConfigureAwait(false);
+            progress?.Report(new LauncherProgress(InstallProgressStages.FinalizingVersion, string.Empty));
             var validation = await new GameFileIntegrityService(httpClient, downloadSpeedLimitState, logger)
                 .ValidateInstalledVersionAsync(
                     new GameFileIntegrityRequest(

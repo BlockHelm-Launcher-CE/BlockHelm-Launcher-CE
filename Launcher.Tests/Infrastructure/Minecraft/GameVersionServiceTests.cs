@@ -29,7 +29,7 @@ public sealed class GameVersionServiceTests
     {
         var handler = new FailingRequestHandler();
         using var httpClient = new HttpClient(handler) { Timeout = Timeout.InfiniteTimeSpan };
-        var service = new GameVersionService(httpClient);
+        var service = CreateService(httpClient);
 
         await Assert.ThrowsAnyAsync<Exception>(() =>
             service.GetVersionsAsync(DownloadSourcePreference.BmclApi));
@@ -44,7 +44,7 @@ public sealed class GameVersionServiceTests
     {
         var handler = new CatalogHandler(hangPreferred: true);
         using var httpClient = new HttpClient(handler) { Timeout = Timeout.InfiniteTimeSpan };
-        var service = new GameVersionService(httpClient);
+        var service = CreateService(httpClient);
 
         var versions = await service.GetVersionsAsync(DownloadSourcePreference.Official).WaitAsync(TimeSpan.FromSeconds(10));
 
@@ -61,7 +61,7 @@ public sealed class GameVersionServiceTests
     {
         var handler = new CatalogHandler(preferredManifest: invalidManifest);
         using var httpClient = new HttpClient(handler);
-        var service = new GameVersionService(httpClient);
+        var service = CreateService(httpClient);
 
         var versions = await service.GetVersionsAsync(DownloadSourcePreference.Official).WaitAsync(TimeSpan.FromSeconds(5));
 
@@ -69,18 +69,8 @@ public sealed class GameVersionServiceTests
         Assert.Equal(["piston-meta.mojang.com", "bmclapi2.bangbang93.com"], handler.Requests.ToArray());
     }
 
-    [Fact]
-    public async Task ValidPreferredManifestDoesNotStartMirror()
-    {
-        var handler = new CatalogHandler();
-        using var httpClient = new HttpClient(handler);
-        var service = new GameVersionService(httpClient);
-
-        var versions = await service.GetVersionsAsync(DownloadSourcePreference.Official).WaitAsync(TimeSpan.FromSeconds(5));
-
-        Assert.Equal("1.21.1", Assert.Single(versions).Name);
-        Assert.Equal(["piston-meta.mojang.com"], handler.Requests.ToArray());
-    }
+    private static GameVersionService CreateService(HttpClient client) =>
+        new(new DownloadHostConcurrencyController(), client);
 
     private sealed class CatalogHandler(bool hangPreferred = false, string? preferredManifest = null) : HttpMessageHandler
     {

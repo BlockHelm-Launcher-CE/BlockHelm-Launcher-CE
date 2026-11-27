@@ -17,26 +17,37 @@
  * SPDX-License-Identifier: GPL-3.0-only
  */
 
+using System.Net;
 using System.Net.Http;
+using Microsoft.Extensions.Logging;
 
 namespace Launcher.Infrastructure.Minecraft;
 
 internal static class MinecraftHttpClientFactory
 {
-    public static HttpClient CreateTransportClient()
+    public static HttpClient CreateTransportClient(LauncherPathProvider? pathProvider = null, ILogger? logger = null, string? connectionPurpose = null)
     {
-        return LauncherHttpUserAgent.Apply(new HttpClient(CreateTransportHandler())
+        var client = LauncherHttpUserAgent.Apply(new HttpClient(CreateTransportHandler(logger, connectionPurpose))
         {
-            Timeout = Timeout.InfiniteTimeSpan
+            Timeout = Timeout.InfiniteTimeSpan,
+            DefaultRequestVersion = HttpVersion.Version20,
+            DefaultVersionPolicy = HttpVersionPolicy.RequestVersionOrLower
         });
+        VanillaVersionMetadataCache.ForLauncher(client, pathProvider ?? new LauncherPathProvider());
+        return client;
     }
 
-    public static HttpMessageHandler CreateTransportHandler()
+    public static HttpMessageHandler CreateTransportHandler(ILogger? logger = null, string? connectionPurpose = null)
     {
-        return new HttpClientHandler
+        return new SocketsHttpHandler
         {
             AllowAutoRedirect = false,
-            UseProxy = true
+            UseProxy = true,
+            ConnectCallback = logger is null ? null : (context, token) =>
+                DownloadConnectionDiagnostics.ConnectAsync(context, logger, connectionPurpose, token),
+            ConnectTimeout = TimeSpan.FromSeconds(10),
+            PooledConnectionLifetime = TimeSpan.FromMinutes(5),
+            PooledConnectionIdleTimeout = TimeSpan.FromMinutes(2)
         };
     }
 }

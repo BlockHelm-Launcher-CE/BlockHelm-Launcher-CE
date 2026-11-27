@@ -17,6 +17,8 @@ using Launcher.Application.Services;
 using Launcher.Domain.Models;
 using Microsoft.Extensions.Logging;
 
+using Launcher.Infrastructure.Minecraft;
+
 namespace Launcher.Infrastructure.Resources;
 
 internal sealed class McresBhlClient(
@@ -87,6 +89,7 @@ internal sealed class McresBhlClient(
         catch (OperationCanceledException exception)
         {
             logger.LogWarning(
+                exception,
                 "MCRES related website lookup timed out. Source={Source} ProjectId={ProjectId} ErrorType={ErrorType}",
                 reference.Source,
                 reference.ProjectId,
@@ -95,6 +98,7 @@ internal sealed class McresBhlClient(
         catch (Exception exception) when (exception is HttpRequestException or JsonException or NotSupportedException)
         {
             logger.LogWarning(
+                exception,
                 "MCRES related website lookup failed. Source={Source} ProjectId={ProjectId} ErrorType={ErrorType}",
                 reference.Source,
                 reference.ProjectId,
@@ -110,41 +114,41 @@ internal sealed class McresBhlClient(
         string apiKey,
         CancellationToken cancellationToken)
     {
-        var requestUri =
-            $"{BaseUrl}/lookup?provider={Uri.EscapeDataString(provider)}&project_id={Uri.EscapeDataString(projectId)}&key={Uri.EscapeDataString(apiKey)}";
-        using var response = await httpClient
-            .GetAsync(requestUri, HttpCompletionOption.ResponseHeadersRead, cancellationToken)
-            .ConfigureAwait(false);
-        if (response.StatusCode is HttpStatusCode.NotFound)
-            return null;
-        if (!response.IsSuccessStatusCode)
+        return await DownloadHttpDiagnostics.ExecuteMetadataAsync<McresLookupResource?>(httpClient, logger, "McresLookup", async requestToken =>
         {
-            logger.LogWarning(
-                "MCRES lookup returned HTTP {StatusCode}. Provider={Provider} ProjectId={ProjectId}",
-                (int)response.StatusCode,
-                provider,
-                projectId);
-            return null;
-        }
+            var requestUri =
+                $"{BaseUrl}/lookup?provider={Uri.EscapeDataString(provider)}&project_id={Uri.EscapeDataString(projectId)}&key={Uri.EscapeDataString(apiKey)}";
+            using var response = await DownloadHttpDiagnostics.GetAsync(httpClient, logger, requestUri, HttpCompletionOption.ResponseHeadersRead, requestToken, cancellationToken)
+                .ConfigureAwait(false);
+            if (response.StatusCode is HttpStatusCode.NotFound)
+                return null;
+            if (!response.IsSuccessStatusCode)
+            {
+                logger.LogWarning(
+                    "MCRES lookup returned HTTP {StatusCode}. Provider={Provider} ProjectId={ProjectId}",
+                    (int)response.StatusCode,
+                    provider,
+                    projectId);
+                return null;
+            }
 
-        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
-        var result = await JsonSerializer
-            .DeserializeAsync<McresLookupResponse>(stream, JsonOptions, cancellationToken)
-            .ConfigureAwait(false);
-        if (result is null || result.Code is 404 || result.Resources is null || result.Resources.Count == 0)
-            return null;
-        if (result.Code is not 0)
-        {
-            logger.LogWarning(
-                "MCRES lookup returned application code {Code}. Provider={Provider} ProjectId={ProjectId}",
-                result.Code,
-                provider,
-                projectId);
-            return null;
-        }
+            var result = await DownloadHttpDiagnostics.DeserializeJsonAsync<McresLookupResponse>(response, logger, requestToken, JsonOptions)
+                .ConfigureAwait(false);
+            if (result is null || result.Code is 404 || result.Resources is null || result.Resources.Count == 0)
+                return null;
+            if (result.Code is not 0)
+            {
+                logger.LogWarning(
+                    "MCRES lookup returned application code {Code}. Provider={Provider} ProjectId={ProjectId}",
+                    result.Code,
+                    provider,
+                    projectId);
+                return null;
+            }
 
-        var first = result.Resources[0];
-        return first.ResourceId > 0 && IsSupportedResourceType(first.ResourceType) ? first : null;
+            var first = result.Resources[0];
+            return first.ResourceId > 0 && IsSupportedResourceType(first.ResourceType) ? first : null;
+        }, cancellationToken).ConfigureAwait(false);
     }
 
     private async Task<McresDetailResponse?> LoadDetailAsync(
@@ -152,40 +156,40 @@ internal sealed class McresBhlClient(
         string apiKey,
         CancellationToken cancellationToken)
     {
-        var requestUri =
-            $"{BaseUrl}/detail/{Uri.EscapeDataString(resource.ResourceType)}/{resource.ResourceId}?key={Uri.EscapeDataString(apiKey)}";
-        using var response = await httpClient
-            .GetAsync(requestUri, HttpCompletionOption.ResponseHeadersRead, cancellationToken)
-            .ConfigureAwait(false);
-        if (response.StatusCode is HttpStatusCode.NotFound)
-            return null;
-        if (!response.IsSuccessStatusCode)
+        return await DownloadHttpDiagnostics.ExecuteMetadataAsync<McresDetailResponse?>(httpClient, logger, "McresDetail", async requestToken =>
         {
-            logger.LogWarning(
-                "MCRES detail returned HTTP {StatusCode}. ResourceType={ResourceType} ResourceId={ResourceId}",
-                (int)response.StatusCode,
-                resource.ResourceType,
-                resource.ResourceId);
-            return null;
-        }
+            var requestUri =
+                $"{BaseUrl}/detail/{Uri.EscapeDataString(resource.ResourceType)}/{resource.ResourceId}?key={Uri.EscapeDataString(apiKey)}";
+            using var response = await DownloadHttpDiagnostics.GetAsync(httpClient, logger, requestUri, HttpCompletionOption.ResponseHeadersRead, requestToken, cancellationToken)
+                .ConfigureAwait(false);
+            if (response.StatusCode is HttpStatusCode.NotFound)
+                return null;
+            if (!response.IsSuccessStatusCode)
+            {
+                logger.LogWarning(
+                    "MCRES detail returned HTTP {StatusCode}. ResourceType={ResourceType} ResourceId={ResourceId}",
+                    (int)response.StatusCode,
+                    resource.ResourceType,
+                    resource.ResourceId);
+                return null;
+            }
 
-        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
-        var result = await JsonSerializer
-            .DeserializeAsync<McresDetailResponse>(stream, JsonOptions, cancellationToken)
-            .ConfigureAwait(false);
-        if (result is null || result.Code is 404)
-            return null;
-        if (result.Code is not 0)
-        {
-            logger.LogWarning(
-                "MCRES detail returned application code {Code}. ResourceType={ResourceType} ResourceId={ResourceId}",
-                result.Code,
-                resource.ResourceType,
-                resource.ResourceId);
-            return null;
-        }
+            var result = await DownloadHttpDiagnostics.DeserializeJsonAsync<McresDetailResponse>(response, logger, requestToken, JsonOptions)
+                .ConfigureAwait(false);
+            if (result is null || result.Code is 404)
+                return null;
+            if (result.Code is not 0)
+            {
+                logger.LogWarning(
+                    "MCRES detail returned application code {Code}. ResourceType={ResourceType} ResourceId={ResourceId}",
+                    result.Code,
+                    resource.ResourceType,
+                    resource.ResourceId);
+                return null;
+            }
 
-        return result;
+            return result;
+        }, cancellationToken).ConfigureAwait(false);
     }
 
     private static bool Supports(ResourceProjectKind kind) =>

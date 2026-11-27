@@ -63,7 +63,8 @@ public sealed class VanillaLoaderProvider : ILoaderProvider, ISeparatedInstallPa
         string minecraftVersion,
         DownloadSourcePreference downloadSourcePreference = LauncherDefaults.DefaultDownloadSourcePreference,
         CancellationToken cancellationToken = default,
-        int downloadSpeedLimitMbPerSecond = 0)
+        int downloadSpeedLimitMbPerSecond = 0,
+        bool interactive = false)
     {
         IReadOnlyList<LoaderVersionInfo> versions = [new LoaderVersionInfo(nameof(LoaderKind.Vanilla))];
         return Task.FromResult(versions);
@@ -83,7 +84,7 @@ public sealed class VanillaLoaderProvider : ILoaderProvider, ISeparatedInstallPa
         _ = loaderVersion;
         return InstallCoreAsync(
             minecraftVersion,
-            new MinecraftPath(gameDirectory),
+            new InstanceMinecraftPath(gameDirectory),
             gameDirectory,
             gameDirectory,
             isolatedVersionName,
@@ -139,7 +140,8 @@ public sealed class VanillaLoaderProvider : ILoaderProvider, ISeparatedInstallPa
             downloadSpeedLimitMbPerSecond,
             downloadSpeedLimitState,
             downloadOperation,
-            speedMeter);
+            speedMeter,
+            runtimeHttpClient: httpClient);
         AttachProgress(launcher, progress);
         var finalVersionName = await ComposedVersionInstallRunner.RunAsync(
             token => VanillaVersionComposer.PrepareFinalVersionAsync(
@@ -154,6 +156,7 @@ public sealed class VanillaLoaderProvider : ILoaderProvider, ISeparatedInstallPa
                 token),
             async (versionName, token) => await launcher.InstallAsync(versionName, token).ConfigureAwait(false),
             cancellationToken).ConfigureAwait(false);
+        progress?.Report(new LauncherProgress(InstallProgressStages.FinalizingVersion, string.Empty));
         await EnsureInstalledVersionIsValidAsync(
             finalVersionName,
             minecraftVersion,
@@ -312,7 +315,7 @@ public sealed class VanillaLoaderProvider : ILoaderProvider, ISeparatedInstallPa
         CmlLibJavaFileMode javaFileMode = CmlLibJavaFileMode.Exclude)
     {
         return CreateLauncher(
-            new MinecraftPath(gameDirectory),
+            new InstanceMinecraftPath(gameDirectory),
             progress,
             downloadSourcePreference,
             logger,
@@ -332,7 +335,9 @@ public sealed class VanillaLoaderProvider : ILoaderProvider, ISeparatedInstallPa
         IDownloadSpeedLimitState? downloadSpeedLimitState = null,
         MinecraftDownloadOperationContext? operationContext = null,
         SpeedMeter? sharedSpeedMeter = null,
-        CmlLibJavaFileMode javaFileMode = CmlLibJavaFileMode.Exclude)
+        CmlLibJavaFileMode javaFileMode = CmlLibJavaFileMode.Exclude,
+        LoaderBaseContentPart contentPart = LoaderBaseContentPart.All,
+        HttpClient? runtimeHttpClient = null)
     {
         // 统一注入镜像路由、限速和运行库下载器，保证 Vanilla/Fabric 使用相同下载策略。
         var parameters = MinecraftLauncherParameters.CreateDefault(path);
@@ -346,6 +351,7 @@ public sealed class VanillaLoaderProvider : ILoaderProvider, ISeparatedInstallPa
         {
             Timeout = Timeout.InfiniteTimeSpan
         });
+        VanillaVersionMetadataCache.ForLauncher(parameters.HttpClient, new LauncherPathProvider());
         parameters.VersionLoader = new InstanceAuthoritativeVersionLoader(
             path,
             (versionName, cancellationToken) => VanillaVersionMetadataClient.DownloadVersionJsonAsync(
@@ -355,18 +361,24 @@ public sealed class VanillaLoaderProvider : ILoaderProvider, ISeparatedInstallPa
                 downloadSpeedLimitMbPerSecond,
                 downloadSpeedLimitState,
                 logger,
-                cancellationToken));
-        var runtimeHttpClient = MinecraftHttpClientFactory.CreateTransportClient();
+                cancellationToken),
+            logger);
+        runtimeHttpClient ??= MinecraftHttpClientFactory.CreateTransportClient(logger: logger, connectionPurpose: "MinecraftContent");
         var runtimeExecutor = new MinecraftDownloadRequestExecutor(
             runtimeHttpClient,
             logger,
             bandwidthLimiter,
-            category: DownloadConcurrencyCategory.Runtime);
+            category: DownloadConcurrencyCategory.Runtime,
+            hostHealthTracker: operationContext?.HostHealth);
         var assetIndexExecutor = new MinecraftDownloadRequestExecutor(
             runtimeHttpClient,
             logger,
             bandwidthLimiter,
-            category: DownloadConcurrencyCategory.Metadata);
+            category: DownloadConcurrencyCategory.Metadata,
+            hostHealthTracker: operationContext?.HostHealth);
+        var assetProgress = contentPart is LoaderBaseContentPart.Assets && progress is not null
+            ? new AssetInstallProgress(progress)
+            : null;
         var gameInstaller = DownloadSpeedTrackingGameInstaller.CreateAsCoreCount(
             parameters.HttpClient,
             runtimeExecutor,
@@ -375,7 +387,8 @@ public sealed class VanillaLoaderProvider : ILoaderProvider, ISeparatedInstallPa
             path,
             operationContext,
             sharedSpeedMeter,
-            logger);
+            logger,
+            assetProgress);
         parameters.GameInstaller = gameInstaller;
         var globalDownloadSnapshot = ImportConcurrencyLimiter.Shared.DownloadSnapshot;
         logger?.LogDebug(
@@ -384,7 +397,7 @@ public sealed class VanillaLoaderProvider : ILoaderProvider, ISeparatedInstallPa
             gameInstaller.ConfiguredMaxDownloader,
             globalDownloadSnapshot.CurrentTarget);
         var fileExtractors = parameters.FileExtractors
-            ?? throw new InvalidOperationException("CmlLib did not configure its default file extractors.");
+            ?? throw SafeExceptionLog.Describe(new InvalidOperationException("CmlLib did not configure its default file extractors."), "DownloadValidation", ("Reason", "CmlLib did not configure its default file extractors."));
         if (javaFileMode is CmlLibJavaFileMode.Only)
         {
             for (var index = fileExtractors.Count() - 1; index >= 0; index--)
@@ -410,14 +423,28 @@ public sealed class VanillaLoaderProvider : ILoaderProvider, ISeparatedInstallPa
             .Select((extractor, index) => (extractor, index))
             .First(entry => entry.extractor is CmlLib.Core.FileExtractors.AssetFileExtractor);
         fileExtractors.RemoveAt(defaultAssetExtractor.index);
-        fileExtractors.Insert(
-            defaultAssetExtractor.index,
-            new SafeAssetFileExtractor(assetIndexExecutor, downloadSourcePreference, operationContext, sharedSpeedMeter, logger));
+        if (contentPart is not LoaderBaseContentPart.WithoutClientOrAssets)
+        {
+            var assetExtractor = new SafeAssetFileExtractor(assetIndexExecutor, downloadSourcePreference, operationContext,
+                sharedSpeedMeter, logger, assetProgress);
+            if (contentPart is LoaderBaseContentPart.Assets)
+            {
+                for (var index = fileExtractors.Count() - 1; index >= 0; index--)
+                    fileExtractors.RemoveAt(index);
+                fileExtractors.Insert(0, assetExtractor);
+                return new MinecraftLauncher(parameters);
+            }
+            fileExtractors.Insert(defaultAssetExtractor.index, assetExtractor);
+        }
 
         var clientExtractor = fileExtractors
             .Select((extractor, index) => (extractor, index))
             .First(entry => entry.extractor is CmlLib.Core.FileExtractors.ClientFileExtractor);
-        if (clientExtractor.index > 0)
+        if (contentPart is LoaderBaseContentPart.WithoutClientOrAssets)
+        {
+            fileExtractors.RemoveAt(clientExtractor.index);
+        }
+        else if (clientExtractor.index > 0)
         {
             fileExtractors.RemoveAt(clientExtractor.index);
             fileExtractors.Insert(0, clientExtractor.extractor);

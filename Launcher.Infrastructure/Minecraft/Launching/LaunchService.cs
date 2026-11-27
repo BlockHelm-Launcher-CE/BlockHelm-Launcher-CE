@@ -17,6 +17,7 @@
  * SPDX-License-Identifier: GPL-3.0-only
  */
 
+using Launcher.Infrastructure.Persistence;
 using System.IO;
 using CmlLib.Core;
 using CmlLib.Core.Auth;
@@ -49,6 +50,7 @@ public sealed partial class LaunchService : ILaunchService
     private readonly IOfflineSkinLaunchService? offlineSkinLaunchService;
     private readonly LaunchSettingsResolver launchSettingsResolver;
     private readonly ILogger<LaunchService> logger;
+    private readonly InstanceActivityCoordinator? instanceActivityCoordinator;
 
     public LaunchService(
         ILaunchAccountSessionService accountSessionService,
@@ -60,7 +62,8 @@ public sealed partial class LaunchService : ILaunchService
         IGameLanguageService? gameLanguageService = null,
         ILogger<LaunchService>? logger = null,
         IAuthlibInjectorProvisioningService? authlibInjectorProvisioningService = null,
-        IOfflineSkinLaunchService? offlineSkinLaunchService = null)
+        IOfflineSkinLaunchService? offlineSkinLaunchService = null,
+        InstanceActivityCoordinator? instanceActivityCoordinator = null)
         : this(
             accountSessionService,
             new GameFileIntegrityService(downloadSpeedLimitState),
@@ -74,7 +77,8 @@ public sealed partial class LaunchService : ILaunchService
             gameLanguageService,
             logger,
             authlibInjectorProvisioningService,
-            offlineSkinLaunchService)
+            offlineSkinLaunchService,
+            instanceActivityCoordinator: instanceActivityCoordinator)
     {
     }
 
@@ -89,7 +93,8 @@ public sealed partial class LaunchService : ILaunchService
         IGameLanguageService? gameLanguageService = null,
         ILogger<LaunchService>? logger = null,
         IAuthlibInjectorProvisioningService? authlibInjectorProvisioningService = null,
-        IOfflineSkinLaunchService? offlineSkinLaunchService = null)
+        IOfflineSkinLaunchService? offlineSkinLaunchService = null,
+        InstanceActivityCoordinator? instanceActivityCoordinator = null)
         : this(
             accountSessionService,
             gameFileIntegrityService,
@@ -103,7 +108,8 @@ public sealed partial class LaunchService : ILaunchService
             gameLanguageService,
             logger,
             authlibInjectorProvisioningService,
-            offlineSkinLaunchService)
+            offlineSkinLaunchService,
+            instanceActivityCoordinator: instanceActivityCoordinator)
     {
     }
 
@@ -122,7 +128,8 @@ public sealed partial class LaunchService : ILaunchService
         IAuthlibInjectorProvisioningService? authlibInjectorProvisioningService = null,
         IOfflineSkinLaunchService? offlineSkinLaunchService = null,
         IGameStartupReadinessWaiter? gameStartupReadinessWaiter = null,
-        ILaunchProcessTerminator? launchProcessTerminator = null)
+        ILaunchProcessTerminator? launchProcessTerminator = null,
+        InstanceActivityCoordinator? instanceActivityCoordinator = null)
         : this(
             accountSessionService,
             new LegacyManagedVersionRepairAdapter(versionRepairService),
@@ -138,7 +145,8 @@ public sealed partial class LaunchService : ILaunchService
             authlibInjectorProvisioningService,
             offlineSkinLaunchService,
             gameStartupReadinessWaiter,
-            launchProcessTerminator)
+            launchProcessTerminator,
+            instanceActivityCoordinator)
     {
     }
 
@@ -157,9 +165,11 @@ public sealed partial class LaunchService : ILaunchService
         IAuthlibInjectorProvisioningService? authlibInjectorProvisioningService = null,
         IOfflineSkinLaunchService? offlineSkinLaunchService = null,
         IGameStartupReadinessWaiter? gameStartupReadinessWaiter = null,
-        ILaunchProcessTerminator? launchProcessTerminator = null)
+        ILaunchProcessTerminator? launchProcessTerminator = null,
+        InstanceActivityCoordinator? instanceActivityCoordinator = null)
     {
         this.accountSessionService = accountSessionService;
+        this.instanceActivityCoordinator = instanceActivityCoordinator;
         this.gameFileIntegrityService = gameFileIntegrityService;
         this.launcherFactory = launcherFactory;
         this.crashMonitor = crashMonitor;
@@ -230,15 +240,15 @@ public sealed partial class LaunchService : ILaunchService
         var launchAttemptStartedAt = DateTimeOffset.UtcNow;
         LaunchSessionDiagnosticCollector? failureDiagnosticCollector = null;
         logger.LogInformation(
-            "Game launch started. InstanceId={InstanceId} InstanceName={InstanceName} VersionName={VersionName} Loader={Loader} MemoryMb={MemoryMb}",
-            instance.Id,
+            "Game launch started. InstanceDirectory={InstanceDirectory} InstanceName={InstanceName} VersionName={VersionName} Loader={Loader} MemoryMb={MemoryMb}",
+            instance.InstanceDirectory,
             instance.Name,
             versionName,
             instance.Loader,
             memoryMb);
         logger.LogInformation(
-            "Launch settings resolved. InstanceId={InstanceId} HasPreLaunchCommand={HasPreLaunchCommand} WaitForPreLaunchCommand={WaitForPreLaunchCommand} HasPostExitCommand={HasPostExitCommand} HasExtraJvmArguments={HasExtraJvmArguments} HasExtraGameArguments={HasExtraGameArguments}",
-            instance.Id,
+            "Launch settings resolved. InstanceDirectory={InstanceDirectory} HasPreLaunchCommand={HasPreLaunchCommand} WaitForPreLaunchCommand={WaitForPreLaunchCommand} HasPostExitCommand={HasPostExitCommand} HasExtraJvmArguments={HasExtraJvmArguments} HasExtraGameArguments={HasExtraGameArguments}",
+            instance.InstanceDirectory,
             !string.IsNullOrWhiteSpace(resolvedSettings.PreLaunchCommand),
             resolvedSettings.WaitForPreLaunchCommand,
             !string.IsNullOrWhiteSpace(resolvedSettings.PostExitCommand),
@@ -247,6 +257,14 @@ public sealed partial class LaunchService : ILaunchService
 
         try
         {
+            if (!InstanceDirectoryClassifier.IsInstanceDirectory(instance.InstanceDirectory)
+                || !MinecraftDirectoryPath.Equals(instance.InstanceDirectory,
+                    Path.Combine(settings.MinecraftDirectory, "versions", versionName)))
+                throw new GameInstanceMutationConflictException(instance.InstanceDirectory, versionName);
+            if (InstanceDirectoryOwnership.IsObserved(instance))
+                InstanceDirectoryOwnership.EnsureCurrent(instance);
+            using var instanceLease = InstanceDirectoryOwnership.IsObserved(instance)
+                ? InstanceDirectoryOwnership.AcquireReadLease(instance) : null;
             failureDiagnosticCollector = new LaunchSessionDiagnosticCollector(
                 settings.MinecraftDirectory,
                 instance.InstanceDirectory);
@@ -262,6 +280,8 @@ public sealed partial class LaunchService : ILaunchService
             selectedJavaRuntime = preparedRuntime.JavaRuntime;
             diagnosticContext = preparedRuntime.DiagnosticContext;
 
+            if (InstanceDirectoryOwnership.IsObserved(instance))
+                InstanceDirectoryOwnership.EnsureCurrent(instance);
             var startedProcess = await BuildAndStartProcessAsync(
                     instance,
                     settings,
@@ -300,7 +320,7 @@ public sealed partial class LaunchService : ILaunchService
                 readiness);
             var session = startedProcess.CrashMonitorSession.CreateGameLaunchSession(process, diagnosticContext);
             return new GameLaunchSession(
-                session.InstanceId,
+                session.InstanceDirectory,
                 session.InstanceName,
                 LogGameExitAsync(session.ExitTask, diagnosticContext),
                 preparedRuntime.Warnings);
@@ -326,10 +346,11 @@ public sealed partial class LaunchService : ILaunchService
                 {
                     logger.LogError(
                         terminationException,
-                        "Failed to terminate Minecraft after launch cancellation. InstanceId={InstanceId} VersionName={VersionName}",
-                        diagnosticContext.InstanceId,
+                        "Failed to terminate Minecraft after launch cancellation. InstanceDirectory={InstanceDirectory} VersionName={VersionName}",
+                        diagnosticContext.InstanceDirectory,
                         diagnosticContext.VersionName);
                     var monitorSession = crashMonitorSession.CreateGameLaunchSession(canceledProcess, diagnosticContext);
+                    KeepInstanceBusyUntilExit(diagnosticContext.InstanceDirectory, monitorSession.ExitTask);
                     _ = ObserveGameExitAfterCancellationCleanupFailureAsync(
                         monitorSession.ExitTask,
                         diagnosticContext);
@@ -347,13 +368,13 @@ public sealed partial class LaunchService : ILaunchService
             }
 
             logger.LogInformation(
-                "Game launch canceled. InstanceId={InstanceId} InstanceName={InstanceName} VersionName={VersionName} JavaVersion={JavaVersion} JavaSource={JavaSource}",
-                diagnosticContext.InstanceId,
+                "Game launch canceled. InstanceDirectory={InstanceDirectory} InstanceName={InstanceName} VersionName={VersionName} JavaVersion={JavaVersion} JavaSource={JavaSource}",
+                diagnosticContext.InstanceDirectory,
                 diagnosticContext.InstanceName,
                 diagnosticContext.VersionName,
                 diagnosticContext.JavaVersion,
                 diagnosticContext.JavaSource);
-            logger.LogDebug("Canceled game launch Java path. InstanceId={InstanceId} JavaPath={JavaPath}", diagnosticContext.InstanceId, diagnosticContext.JavaPath);
+            logger.LogDebug("Canceled game launch Java path. InstanceDirectory={InstanceDirectory} JavaPath={JavaPath}", diagnosticContext.InstanceDirectory, diagnosticContext.JavaPath);
             throw;
         }
         catch (LaunchAccountSessionException exception)
@@ -400,6 +421,7 @@ public sealed partial class LaunchService : ILaunchService
         }
         catch (Exception exception) when (exception is not OperationCanceledException)
         {
+            ProtectRunningProcess(instance.InstanceDirectory, process);
             var report = await WriteFailureDiagnosticAsync(
                 diagnosticContext,
                 "launch_failed",
@@ -410,6 +432,27 @@ public sealed partial class LaunchService : ILaunchService
                 launchAttemptStartedAt,
                 cancellationToken);
             throw new LaunchFailedException(report, exception);
+        }
+    }
+
+    private void KeepInstanceBusyUntilExit(string instanceDirectory, Task exitTask)
+    {
+        if (instanceActivityCoordinator is null) return;
+        var lease = instanceActivityCoordinator.EnterLaunch(instanceDirectory);
+        _ = exitTask.ContinueWith(_ => lease.Dispose(), CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+    }
+
+    private void ProtectRunningProcess(string instanceDirectory, System.Diagnostics.Process? process)
+    {
+        if (instanceActivityCoordinator is null || process is null) return;
+        try
+        {
+            if (!process.HasExited) KeepInstanceBusyUntilExit(instanceDirectory, process.WaitForExitAsync());
+        }
+        catch (Exception exception) when (exception is InvalidOperationException or System.ComponentModel.Win32Exception)
+        {
+            logger.LogWarning(exception, "Unable to track process after launch failure. InstanceDirectory={InstanceDirectory}", instanceDirectory);
         }
     }
 }

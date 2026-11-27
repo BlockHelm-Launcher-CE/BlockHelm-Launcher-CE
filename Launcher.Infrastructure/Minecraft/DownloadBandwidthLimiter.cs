@@ -37,6 +37,8 @@ internal sealed class DownloadBandwidthLimiter
     private readonly int defaultDownloadSpeedLimitMbPerSecond;
     private readonly IDownloadSpeedLimitState? downloadSpeedLimitState;
 
+    public bool IsEnabled => ResolveBytesPerSecond() > 0;
+
     private DownloadBandwidthLimiter(
         SharedBudgetState sharedBudgetState,
         int defaultDownloadSpeedLimitMbPerSecond,
@@ -137,6 +139,16 @@ internal sealed class DownloadBandwidthLimiter
     }
 }
 
+internal sealed record SegmentedReadProgress(
+    Func<long> GetRemainingBytes,
+    Func<double, long, bool> RequestSplit,
+    Func<SegmentedSlowSourceRecovery?>? GetSlowSourceRecovery = null);
+
+internal sealed class SegmentedRangeSourceSwitchException(ResolvedDownloadRequest backup) : Exception
+{
+    public ResolvedDownloadRequest Backup { get; } = backup;
+}
+
 internal static class DownloadResponseThrottler
 {
     /// <summary>
@@ -153,7 +165,10 @@ internal static class DownloadResponseThrottler
         long minimumBodyBytesPerSecond = 0,
         TimeProvider? timeProvider = null,
         Action<long>? reportBodyBytes = null,
-        SpeedMeter? speedMeter = null)
+        SpeedMeter? speedMeter = null,
+        long? expectedContentLength = null,
+        Func<double, bool>? shouldSwitchSlowSource = null,
+        SegmentedReadProgress? rangeProgress = null)
     {
         if (response.Content is null)
         {
@@ -177,9 +192,12 @@ internal static class DownloadResponseThrottler
                 effectiveIdleTimeout,
                 slowBodyReadThreshold,
                 minimumBodyBytesPerSecond,
-                originalContent.Headers.ContentLength,
+                originalContent.Headers.ContentLength ?? expectedContentLength,
                 cancellationToken,
-                timeProvider ?? TimeProvider.System)
+                timeProvider ?? TimeProvider.System,
+                reportBodyBytes,
+                shouldSwitchSlowSource,
+                rangeProgress)
             : originalStream;
         if (reportBodyBytes is not null)
         {
@@ -203,13 +221,13 @@ internal static class DownloadResponseThrottler
     }
 
     internal static bool IsBodyReadTooSlow(
-        int bytesRead,
+        long bytesRead,
         TimeSpan readDuration,
         TimeSpan slowReadThreshold,
         long minimumBytesPerSecond)
     {
         if (bytesRead <= 0 || slowReadThreshold < TimeSpan.Zero || minimumBytesPerSecond <= 0
-            || readDuration <= slowReadThreshold || readDuration.TotalSeconds <= 0)
+            || readDuration < slowReadThreshold || readDuration.TotalSeconds <= 0)
         {
             return false;
         }
@@ -399,9 +417,17 @@ internal static class DownloadResponseThrottler
         private readonly long? contentLength;
         private readonly CancellationToken operationCancellationToken;
         private readonly TimeProvider timeProvider;
+        private readonly Action<long>? reportDiscardedBytes;
+        private readonly Func<double, bool>? shouldSwitchSlowSource;
+        private readonly SegmentedReadProgress? rangeProgress;
         private bool hasReadFirstByte;
         private long totalBytesRead;
+        private long windowBytes;
+        private TimeSpan windowReadDuration;
+        private bool previousWindowExceededEstimate;
         private DownloadBodyTooSlowException? pendingSlowFailure;
+        private SegmentedSlowSourceRecovery? activeRangeRecovery;
+        private double? pendingRangeSourceRate;
 
         public BodyProgressReadStream(
             Stream innerStream,
@@ -411,7 +437,10 @@ internal static class DownloadResponseThrottler
             long minimumBytesPerSecond,
             long? contentLength,
             CancellationToken operationCancellationToken,
-            TimeProvider timeProvider)
+            TimeProvider timeProvider,
+            Action<long>? reportDiscardedBytes,
+            Func<double, bool>? shouldSwitchSlowSource,
+            SegmentedReadProgress? rangeProgress)
         {
             this.innerStream = innerStream;
             this.firstByteTimeout = firstByteTimeout;
@@ -421,6 +450,9 @@ internal static class DownloadResponseThrottler
             this.contentLength = contentLength;
             this.operationCancellationToken = operationCancellationToken;
             this.timeProvider = timeProvider;
+            this.reportDiscardedBytes = reportDiscardedBytes;
+            this.shouldSwitchSlowSource = shouldSwitchSlowSource;
+            this.rangeProgress = rangeProgress;
         }
 
         public override bool CanRead => innerStream.CanRead;
@@ -498,38 +530,109 @@ internal static class DownloadResponseThrottler
         private void ObserveRead(int read, TimeSpan readDuration)
         {
             if (read <= 0)
-                return;
-
-            totalBytesRead += read;
-            if (!hasReadFirstByte)
             {
-                hasReadFirstByte = true;
+                pendingSlowFailure = null;
                 return;
             }
 
-            var completedKnownBody = contentLength is { } length && totalBytesRead >= length;
-            if (!completedKnownBody
-                && slowReadThreshold is { } threshold
-                && IsBodyReadTooSlow(read, readDuration, threshold, minimumBytesPerSecond))
+            if (pendingSlowFailure is { } failure)
+            {
+                // Unknown-length bodies need one more read to distinguish EOF
+                // from a slow transfer. Account for these discarded wire bytes.
+                pendingSlowFailure = null;
+                reportDiscardedBytes?.Invoke(read);
+                throw failure;
+            }
+
+            var firstRead = !hasReadFirstByte;
+            hasReadFirstByte = true;
+            totalBytesRead += read;
+            // The first read includes the wait for the first byte, which is
+            // governed by its own timeout and is not transfer throughput.
+            if (firstRead)
+            {
+                activeRangeRecovery = rangeProgress?.GetSlowSourceRecovery?.Invoke();
+                activeRangeRecovery?.BodyStarted();
+            }
+            if (firstRead || slowReadThreshold is not { } threshold)
+                return;
+            windowBytes += read;
+            windowReadDuration += readDuration;
+            if (windowReadDuration < threshold)
+                return;
+
+            var rate = windowReadDuration.TotalSeconds > 0 ? windowBytes / windowReadDuration.TotalSeconds : 0;
+            // This chunk has been read but the range writer has not advanced its cursor yet.
+            var remaining = GetRemainingBytes(read);
+            var estimatedSeconds = remaining is { } bytes && rate > 0 ? bytes / rate : (double?)null;
+            var exceedsEstimate = estimatedSeconds is { } seconds && shouldSwitchSlowSource?.Invoke(seconds) == true;
+            var finishingSoon = remaining <= 0 || estimatedSeconds <= threshold.TotalSeconds;
+            var requestedSplit = !finishingSoon && estimatedSeconds is { } estimate && remaining is { } rangeBytes
+                && rangeProgress?.RequestSplit(estimate, rangeBytes) == true;
+            if (activeRangeRecovery is not null)
+                pendingRangeSourceRate = finishingSoon || requestedSplit ? 0 : rate;
+            if (!requestedSplit && exceedsEstimate && previousWindowExceededEstimate)
+            {
+                pendingSlowFailure = new DownloadBodyTooSlowException(windowBytes, windowReadDuration, estimatedSeconds);
+            }
+            else if (!requestedSplit && !finishingSoon
+                && IsBodyReadTooSlow(windowBytes, windowReadDuration, threshold, minimumBytesPerSecond))
             {
                 // Return this chunk first so the file session persists it. The
-                // next read fails before any additional network data is consumed.
-                pendingSlowFailure = new DownloadBodyTooSlowException(read, readDuration);
+                // next read fails, except for the unknown-length EOF check above.
+                pendingSlowFailure = new DownloadBodyTooSlowException(windowBytes, windowReadDuration);
             }
+            previousWindowExceededEstimate = exceedsEstimate;
+            windowBytes = 0;
+            windowReadDuration = TimeSpan.Zero;
         }
 
         private void ThrowPendingSlowFailure()
         {
-            if (pendingSlowFailure is not { } failure)
+            if (pendingRangeSourceRate is { } rangeRate)
+            {
+                pendingRangeSourceRate = null;
+                // The preceding read has now been persisted and the next request can
+                // use the updated cursor without interrupting a write.
+                if (activeRangeRecovery?.GetBackup(rangeRate, GetRemainingBytes() ?? 0,
+                        rangeProgress!.GetRemainingBytes) is { } backup)
+                    throw new SegmentedRangeSourceSwitchException(backup);
+            }
+            if ((contentLength is null && rangeProgress is null) || pendingSlowFailure is not { } failure)
                 return;
             pendingSlowFailure = null;
+            // The allocator may have split this range while the latest chunk was being written.
+            var remaining = GetRemainingBytes();
+            var seconds = remaining is { } bytes && failure.BytesPerSecond > 0
+                ? bytes / failure.BytesPerSecond
+                : failure.EstimatedRemainingSeconds;
+            if (rangeProgress is not null && seconds <= slowReadThreshold?.TotalSeconds
+                || failure.EstimatedRemainingSeconds is not null
+                    && (seconds is not { } estimate || shouldSwitchSlowSource?.Invoke(estimate) != true))
+            {
+                previousWindowExceededEstimate = false;
+                return;
+            }
             throw failure;
+        }
+
+        private long? GetRemainingBytes(int bytesNotWritten = 0)
+        {
+            var responseRemaining = contentLength - totalBytesRead;
+            if (rangeProgress is null)
+                return responseRemaining;
+            var rangeRemaining = Math.Max(0, rangeProgress.GetRemainingBytes() - bytesNotWritten);
+            return Math.Min(responseRemaining ?? rangeRemaining, rangeRemaining);
         }
 
         protected override void Dispose(bool disposing)
         {
             if (disposing)
+            {
+                activeRangeRecovery?.BodyEnded();
+                activeRangeRecovery = null;
                 innerStream.Dispose();
+            }
             base.Dispose(disposing);
         }
 

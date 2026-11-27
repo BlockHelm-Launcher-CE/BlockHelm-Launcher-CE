@@ -437,6 +437,7 @@ public static class Strings
     public static string DownloadSpeed_KilobytesPerSecondFormat => Get(nameof(DownloadSpeed_KilobytesPerSecondFormat));
     public static string DownloadSpeed_MegabytesPerSecondFormat => Get(nameof(DownloadSpeed_MegabytesPerSecondFormat));
     public static string Settings_DownloadSourceOfficial => Get(nameof(Settings_DownloadSourceOfficial));
+    public static string Settings_DownloadSourceAuto => Get(nameof(Settings_DownloadSourceAuto));
     public static string Settings_DownloadSourceBmclApi => Get(nameof(Settings_DownloadSourceBmclApi));
     public static string Settings_LanguageSection => Get(nameof(Settings_LanguageSection));
     public static string Settings_LauncherLanguageLabel => Get(nameof(Settings_LauncherLanguageLabel));
@@ -613,6 +614,11 @@ public static class Strings
     public static string GameSettings_DetailPlaceholderBodyFormat => Get(nameof(GameSettings_DetailPlaceholderBodyFormat));
     public static string GameSettings_GeneralDescriptionSection => Get(nameof(GameSettings_GeneralDescriptionSection));
     public static string GameSettings_GeneralSaveDescriptionButton => Get(nameof(GameSettings_GeneralSaveDescriptionButton));
+    public static string GameSettings_CleanupButton => Get(nameof(GameSettings_CleanupButton));
+    public static string GameSettings_CleanupDescription => Get(nameof(GameSettings_CleanupDescription));
+    public static string GameSettings_CleanupBusy => Get(nameof(GameSettings_CleanupBusy));
+    public static string GameSettings_CleanupFailed => Get(nameof(GameSettings_CleanupFailed));
+    public static string GameSettings_CleanupResultFormat => Get(nameof(GameSettings_CleanupResultFormat));
     public static string GameSettings_GeneralInstanceDirectorySection => Get(nameof(GameSettings_GeneralInstanceDirectorySection));
     public static string GameSettings_GeneralOpenInstanceDirectoryButton => Get(nameof(GameSettings_GeneralOpenInstanceDirectoryButton));
     public static string GameSettings_GeneralCreatedAtSection => Get(nameof(GameSettings_GeneralCreatedAtSection));
@@ -1234,6 +1240,7 @@ public static class Strings
     public static string Status_InstallPreparing => Get(nameof(Status_InstallPreparing));
     public static string Status_InstallCheckingFiles => Get(nameof(Status_InstallCheckingFiles));
     public static string Status_InstallDownloadingFiles => Get(nameof(Status_InstallDownloadingFiles));
+    public static string Status_InstallInstallingGame => Get(nameof(Status_InstallInstallingGame));
     public static string Status_InstallDownloadingLoaderInstaller => Get(nameof(Status_InstallDownloadingLoaderInstaller));
     public static string Status_InstallRunningLoaderInstaller => Get(nameof(Status_InstallRunningLoaderInstaller));
     public static string Status_InstallFinalizingVersion => Get(nameof(Status_InstallFinalizingVersion));
@@ -1242,6 +1249,7 @@ public static class Strings
     public static string Status_InstallingLoaderFormat => Get(nameof(Status_InstallingLoaderFormat));
     public static string Status_InstanceInstalledFormat => Get(nameof(Status_InstanceInstalledFormat));
     public static string Status_InstallFailed => Get(nameof(Status_InstallFailed));
+    public static string Status_MinecraftAssetInstallFailed => Get(nameof(Status_MinecraftAssetInstallFailed));
     public static string Status_ModpackPreparingArchive => Get(nameof(Status_ModpackPreparingArchive));
     public static string Status_ModpackParsingManifest => Get(nameof(Status_ModpackParsingManifest));
     public static string Status_ModpackResolvingFiles => Get(nameof(Status_ModpackResolvingFiles));

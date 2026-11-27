@@ -68,7 +68,8 @@ public sealed partial class GameSettingsDetailsViewModel : ObservableObject, IDi
         ILogger<GameSettingsDetailsViewModel>? logger = null,
         ILoggerFactory? loggerFactory = null,
         IModpackExportService? modpackExportService = null,
-        IModUpdateService? modUpdateService = null)
+        IModUpdateService? modUpdateService = null,
+        IInstanceCleanupService? instanceCleanupService = null)
     {
         var resolvedLogger = logger ?? NullLogger<GameSettingsDetailsViewModel>.Instance;
         this.logger = resolvedLogger;
@@ -83,7 +84,10 @@ public sealed partial class GameSettingsDetailsViewModel : ObservableObject, IDi
             editDialog,
             instanceFolderService,
             statusService,
-            persistence);
+            persistence,
+            instanceCleanupService,
+            floatingMessageService,
+            loggerFactory?.CreateLogger<InstanceGeneralSettingsViewModel>());
         General.DeleteInstanceRequested += General_DeleteInstanceRequested;
         Launch = new InstanceLaunchSettingsViewModel(systemMemoryService, modService, persistence);
         Java = new InstanceJavaSettingsViewModel(
@@ -145,6 +149,7 @@ public sealed partial class GameSettingsDetailsViewModel : ObservableObject, IDi
         Backup = new InstanceBackupSettingsViewModel(
             this,
             instanceService,
+            persistence,
             backupService,
             downloadTasksPage,
             statusService,
@@ -163,6 +168,7 @@ public sealed partial class GameSettingsDetailsViewModel : ObservableObject, IDi
     }
 
     public event Action<GameInstance>? InstanceSettingsSaved;
+    public event Action? InstancesReloadRequested;
 
     public event Action<GameSettingsInstanceItem>? DeleteInstanceRequested;
 
@@ -294,6 +300,8 @@ public sealed partial class GameSettingsDetailsViewModel : ObservableObject, IDi
         InstanceSettingsSaved?.Invoke(instance);
     }
 
+    public void NotifyInstancesReloadRequired() => InstancesReloadRequested?.Invoke();
+
     public void SuspendLocalWatchersForInstanceMove()
     {
         // 重命名和删除都会移动实例目录；先释放 watcher 和刷新任务持有的目录句柄。
@@ -313,9 +321,9 @@ public sealed partial class GameSettingsDetailsViewModel : ObservableObject, IDi
             ActivateCurrentSection();
     }
 
-    public void ClearSelectedInstanceIf(string instanceId)
+    public void ClearSelectedInstanceIf(string instanceDirectory)
     {
-        if (string.Equals(SelectedInstance?.Instance.Id, instanceId, StringComparison.Ordinal))
+        if (string.Equals(SelectedInstance?.Instance.InstanceDirectory, instanceDirectory, StringComparison.Ordinal))
             SetSelectedInstance(null);
     }
 

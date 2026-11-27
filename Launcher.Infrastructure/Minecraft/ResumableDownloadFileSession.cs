@@ -11,6 +11,8 @@ using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Security.Cryptography;
 
+using Launcher.Application.Services;
+
 namespace Launcher.Infrastructure.Minecraft;
 
 /// <summary>
@@ -28,7 +30,6 @@ internal sealed class ResumableDownloadFileSession : IAsyncDisposable
     private readonly string? managedRoot;
     private readonly bool allowUnverifiedSegmentedDownload;
     private readonly bool useHiddenTemporaryFile;
-    private readonly PartFileCapacityManager.CapacityLease? capacityLease;
     private readonly IDisposable? assetLock;
     private string? sourceCandidateKey;
     private string? strongETag;
@@ -40,6 +41,8 @@ internal sealed class ResumableDownloadFileSession : IAsyncDisposable
     private readonly List<SegmentedWrittenInterval> segmentedWrittenIntervals = [];
     private bool disposed;
 
+    public long SegmentedBytesWritten => Interlocked.Read(ref segmentedBytes);
+
     private ResumableDownloadFileSession(
         string destinationPath,
         string temporaryPath,
@@ -49,7 +52,6 @@ internal sealed class ResumableDownloadFileSession : IAsyncDisposable
         string? managedRoot,
         bool allowUnverifiedSegmentedDownload,
         bool useHiddenTemporaryFile,
-        PartFileCapacityManager.CapacityLease? capacityLease,
         IDisposable? assetLock)
     {
         this.destinationPath = destinationPath;
@@ -60,13 +62,11 @@ internal sealed class ResumableDownloadFileSession : IAsyncDisposable
         this.managedRoot = managedRoot;
         this.allowUnverifiedSegmentedDownload = allowUnverifiedSegmentedDownload;
         this.useHiddenTemporaryFile = useHiddenTemporaryFile;
-        this.capacityLease = capacityLease;
         this.assetLock = assetLock;
     }
 
     public bool IsComplete { get; private set; }
     public bool IsResumeRequested { get; private set; }
-
     public static Task<ResumableDownloadFileSession> AcquireAsync(
         string destinationPath,
         string? expectedSha1,
@@ -75,7 +75,7 @@ internal sealed class ResumableDownloadFileSession : IAsyncDisposable
         DownloadFileOptions? options = null)
     {
         if (string.IsNullOrWhiteSpace(expectedSha1) || !MinecraftFileIntegrity.IsSha1(expectedSha1))
-            throw new InvalidDataException("A resumable game download requires a valid SHA-1 value.");
+            throw SafeExceptionLog.Describe(new InvalidDataException("A resumable game download requires a valid SHA-1 value."), "DownloadValidation", ("Reason", "A resumable game download requires a valid SHA-1 value."));
         return AcquireAsync(destinationPath, DownloadIntegrityExpectation.Sha1(expectedSha1, expectedSize),
             cancellationToken, options);
     }
@@ -99,7 +99,7 @@ internal sealed class ResumableDownloadFileSession : IAsyncDisposable
                 "Managed download");
         }
         var destinationDirectory = Path.GetDirectoryName(normalizedDestination)
-            ?? throw new InvalidOperationException("Download destination has no parent directory.");
+            ?? throw SafeExceptionLog.Describe(new InvalidOperationException("Download destination has no parent directory."), "DownloadValidation", ("Reason", "Download destination has no parent directory."));
         if (managedRoot is null)
         {
             Directory.CreateDirectory(destinationDirectory);
@@ -117,30 +117,25 @@ internal sealed class ResumableDownloadFileSession : IAsyncDisposable
         }
 
         IDisposable? assetLock = null;
-        PartFileCapacityManager.CapacityLease? capacityLease = null;
         try
         {
-            if (options.PersistenceMode is DownloadPersistenceMode.LightweightAtomic)
+            if (options.OperationContext is { } context
+                && (options.PersistenceMode is DownloadPersistenceMode.LightweightAtomic || context.HasRegisteredAsset(normalizedDestination)))
             {
-                assetLock = options.OperationContext is null
-                    ? null
-                    : await options.OperationContext.AcquireAssetLockAsync(normalizedDestination, cancellationToken).ConfigureAwait(false);
+                assetLock = await context.AcquireAssetLockAsync(normalizedDestination, cancellationToken).ConfigureAwait(false);
             }
 
             if (File.Exists(normalizedDestination))
             {
-                using var verifiedLease = options.PersistenceMode is DownloadPersistenceMode.LightweightAtomic
-                    ? options.OperationContext?.AcquireVerifiedFileLease(normalizedDestination, integrity)
-                    : null;
-                var trusted = options.PersistenceMode is DownloadPersistenceMode.LightweightAtomic
-                    && verifiedLease is not null;
-                if (trusted || await integrity.VerifyFileAsync(normalizedDestination, cancellationToken).ConfigureAwait(false))
+                using var verifiedLease = assetLock is not null
+                    ? options.OperationContext?.AcquireVerifiedFileLease(normalizedDestination, integrity) : null;
+                if (verifiedLease is not null || await integrity.VerifyFileAsync(normalizedDestination, cancellationToken).ConfigureAwait(false))
                 {
                     options.OperationContext?.MarkVerified(normalizedDestination, integrity);
                     return new ResumableDownloadFileSession(
                         normalizedDestination, string.Empty, integrity, options.PersistenceMode,
                         options.OperationContext, managedRoot, options.AllowUnverifiedSegmentedDownload,
-                        options.UseHiddenTemporaryFile, null, assetLock) { IsComplete = true };
+                        options.UseHiddenTemporaryFile, assetLock) { IsComplete = true };
                 }
             }
 
@@ -153,17 +148,14 @@ internal sealed class ResumableDownloadFileSession : IAsyncDisposable
                 ? $".{Path.GetFileName(normalizedDestination)}.bhl-pending-{Guid.NewGuid():N}.tmp"
                 : $"{Path.GetFileName(normalizedDestination)}.bhl-pending-{Guid.NewGuid():N}.tmp";
             var temporaryPath = Path.Combine(destinationDirectory, temporaryFileName);
-            if (options.PersistenceMode is DownloadPersistenceMode.TaskScopedResumable)
-                capacityLease = PartFileCapacityManager.Reserve(integrity.ExpectedSize);
 
             return new ResumableDownloadFileSession(
                 normalizedDestination, temporaryPath, integrity, options.PersistenceMode,
                 options.OperationContext, managedRoot, options.AllowUnverifiedSegmentedDownload,
-                options.UseHiddenTemporaryFile, capacityLease, assetLock);
+                options.UseHiddenTemporaryFile, assetLock);
         }
         catch
         {
-            capacityLease?.Dispose();
             assetLock?.Dispose();
             throw;
         }
@@ -197,21 +189,20 @@ internal sealed class ResumableDownloadFileSession : IAsyncDisposable
     public void PrepareSegmentedDownload(long totalLength)
     {
         if (persistenceMode is not DownloadPersistenceMode.TaskScopedResumable)
-            throw new InvalidOperationException("Segmented downloads require task-scoped resumable storage.");
+            throw SafeExceptionLog.Describe(new InvalidOperationException("Segmented downloads require task-scoped resumable storage."), "DownloadValidation", ("Reason", "Segmented downloads require task-scoped resumable storage."));
         if (totalLength <= 0
             || integrity.ExpectedSize.HasValue && integrity.ExpectedSize.Value != totalLength)
         {
-            throw new InvalidDataException("The segmented download total length did not match the trusted size.");
+            throw SafeExceptionLog.Describe(new InvalidDataException("The segmented download total length did not match the trusted size."), "DownloadValidation", ("Reason", "The segmented download total length did not match the trusted size."));
         }
         if (!integrity.HasStrongHash
             && !(allowUnverifiedSegmentedDownload && !integrity.IsVerifiable))
-            throw new InvalidDataException("Segmented downloads require a strong expected hash.");
+            throw SafeExceptionLog.Describe(new InvalidDataException("Segmented downloads require a strong expected hash."), "DownloadValidation", ("Reason", "Segmented downloads require a strong expected hash."));
 
         ResetSegmentedDownload();
         try
         {
             EnsureManagedDestinationIsSafe();
-            capacityLease?.SetExpectedSize(totalLength);
             segmentedDestination = new FileStream(
                 temporaryPath,
                 FileMode.Create,
@@ -229,7 +220,7 @@ internal sealed class ResumableDownloadFileSession : IAsyncDisposable
             segmentedDestination?.Dispose();
             segmentedDestination = null;
             DeleteTemporary();
-            throw new DownloadLocalFileException("Failed to prepare the segmented download temporary file.", exception);
+            throw SafeExceptionLog.Describe(new DownloadLocalFileException("Failed to prepare the segmented download temporary file.", exception), "DownloadLocalFileException", ("Reason", "Failed to prepare the segmented download temporary file."));
         }
     }
 
@@ -245,9 +236,9 @@ internal sealed class ResumableDownloadFileSession : IAsyncDisposable
         Action<long>? reportTransferredBytes = null)
     {
         var destination = segmentedDestination
-            ?? throw new InvalidOperationException("The segmented download temporary file was not prepared.");
+            ?? throw SafeExceptionLog.Describe(new InvalidOperationException("The segmented download temporary file was not prepared."), "DownloadValidation", ("Reason", "The segmented download temporary file was not prepared."));
         if (start < 0 || end < start || knownTotalLength is null || end >= knownTotalLength.Value)
-            throw new InvalidDataException("The segmented download range was invalid.");
+            throw SafeExceptionLog.Describe(new InvalidDataException("The segmented download range was invalid."), "DownloadValidation", ("Reason", "The segmented download range was invalid."));
 
         await using var source = await content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
         var buffer = ArrayPool<byte>.Shared.Rent(BufferSize);
@@ -269,7 +260,7 @@ internal sealed class ResumableDownloadFileSession : IAsyncDisposable
                 var requested = (int)Math.Min(buffer.Length, currentEnd - offset + 1);
                 var read = await ReadNetworkAsync(source, buffer.AsMemory(0, requested), cancellationToken).ConfigureAwait(false);
                 if (read == 0)
-                    throw new DownloadBodyInterruptedException("A segmented response ended before its requested range was complete.");
+                    throw SafeExceptionLog.Describe(new DownloadBodyInterruptedException("A segmented response ended before its requested range was complete."), "DownloadBodyInterruptedException", ("Reason", "A segmented response ended before its requested range was complete."));
 
                 reportTransferredBytes?.Invoke(read);
                 var accepted = adaptiveSegment?.ReserveWrite(offset, read) ?? read;
@@ -279,7 +270,6 @@ internal sealed class ResumableDownloadFileSession : IAsyncDisposable
                     break;
                 }
 
-                capacityLease?.BeforeWrite(accepted);
                 try
                 {
                     await RandomAccess.WriteAsync(
@@ -290,15 +280,15 @@ internal sealed class ResumableDownloadFileSession : IAsyncDisposable
                 }
                 catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
                 {
-                    throw new DownloadLocalFileException("Failed to write a segmented download range.", exception);
+                    throw SafeExceptionLog.Describe(new DownloadLocalFileException("Failed to write a segmented download range.", exception), "DownloadLocalFileException", ("Reason", "Failed to write a segmented download range."));
                 }
                 offset += accepted;
 
                 lock (segmentedProgressLock)
                 {
                     var newlyWritten = RecordSegmentedWrite(offset - accepted, offset - 1);
-                    segmentedBytes += newlyWritten;
-                    reportAttemptProgress?.Invoke(attemptNumber, segmentedBytes, knownTotalLength);
+                    var written = Interlocked.Add(ref segmentedBytes, newlyWritten);
+                    reportAttemptProgress?.Invoke(attemptNumber, written, knownTotalLength);
                 }
 
                 if (accepted < read)
@@ -313,7 +303,7 @@ internal sealed class ResumableDownloadFileSession : IAsyncDisposable
                 && !intentionallyTruncated
                 && await ReadNetworkAsync(source, buffer.AsMemory(0, 1), cancellationToken).ConfigureAwait(false) != 0)
             {
-                throw new DownloadContentValidationException("A segmented response exceeded its requested range.");
+                throw SafeExceptionLog.Describe(new DownloadContentValidationException("A segmented response exceeded its requested range."), "DownloadContentValidationException", ("Reason", "A segmented response exceeded its requested range."));
             }
         }
         finally
@@ -325,7 +315,7 @@ internal sealed class ResumableDownloadFileSession : IAsyncDisposable
     public async Task CompleteSegmentedDownloadAsync(CancellationToken cancellationToken)
     {
         var destination = segmentedDestination
-            ?? throw new InvalidOperationException("The segmented download temporary file was not prepared.");
+            ?? throw SafeExceptionLog.Describe(new InvalidOperationException("The segmented download temporary file was not prepared."), "DownloadValidation", ("Reason", "The segmented download temporary file was not prepared."));
         try
         {
             await destination.FlushAsync(cancellationToken).ConfigureAwait(false);
@@ -335,14 +325,14 @@ internal sealed class ResumableDownloadFileSession : IAsyncDisposable
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
-            throw new DownloadLocalFileException("Failed to flush the segmented download temporary file.", exception);
+            throw SafeExceptionLog.Describe(new DownloadLocalFileException("Failed to flush the segmented download temporary file.", exception), "DownloadLocalFileException", ("Reason", "Failed to flush the segmented download temporary file."));
         }
 
-        if (knownTotalLength is null || Interlocked.Read(ref segmentedBytes) != knownTotalLength.Value)
-            throw new DownloadBodyInterruptedException("The segmented download did not write the expected number of bytes.");
+        if (knownTotalLength is null || SegmentedBytesWritten != knownTotalLength.Value)
+            throw SafeExceptionLog.Describe(new DownloadBodyInterruptedException("The segmented download did not write the expected number of bytes."), "DownloadBodyInterruptedException", ("Reason", "The segmented download did not write the expected number of bytes."), ("Artifact", temporaryPath), ("ExpectedBytes", knownTotalLength), ("ActualBytes", SegmentedBytesWritten));
         if (integrity.IsVerifiable
             && !await VerifyTemporaryAsync(cancellationToken).ConfigureAwait(false))
-            throw new DownloadHashMismatchException("The segmented download did not match its expected hash.");
+            throw integrity.DescribeFailure(new DownloadHashMismatchException("The segmented download did not match its expected hash."));
 
         Publish(cancellationToken);
     }
@@ -351,7 +341,7 @@ internal sealed class ResumableDownloadFileSession : IAsyncDisposable
     {
         segmentedDestination?.Dispose();
         segmentedDestination = null;
-        segmentedBytes = 0;
+        Interlocked.Exchange(ref segmentedBytes, 0);
         segmentedWrittenIntervals.Clear();
         knownTotalLength = null;
         sourceCandidateKey = null;
@@ -402,7 +392,8 @@ internal sealed class ResumableDownloadFileSession : IAsyncDisposable
         int attemptNumber,
         Action<int, long, long?>? reportAttemptProgress,
         CancellationToken cancellationToken,
-        Action<long>? reportTransferredBytes = null)
+        Action<long>? reportTransferredBytes = null,
+        Func<long, string?, string?, SequentialDownloadTail>? prepareTail = null)
     {
         if (IsComplete)
             return;
@@ -415,7 +406,7 @@ internal sealed class ResumableDownloadFileSession : IAsyncDisposable
                 return;
             }
             DeleteTemporary();
-            throw new DownloadContentValidationException("The server rejected the range request and the task-scoped file is not complete.");
+            throw SafeExceptionLog.Describe(new DownloadContentValidationException("The server rejected the range request and the task-scoped file is not complete."), "DownloadContentValidationException", ("Reason", "The server rejected the range request and the task-scoped file is not complete."));
         }
 
         var candidateKey = CreateSourceCandidateKey(resolution);
@@ -423,7 +414,7 @@ internal sealed class ResumableDownloadFileSession : IAsyncDisposable
         if (resumed && !ValidatePartialResponse(response, candidateKey))
         {
             DeleteTemporary();
-            throw new DownloadContentValidationException("The partial response did not match this task-scoped download session.");
+            throw SafeExceptionLog.Describe(new DownloadContentValidationException("The partial response did not match this task-scoped download session."), "DownloadContentValidationException", ("Reason", "The partial response did not match this task-scoped download session."));
         }
         if (!resumed)
             DeleteTemporary();
@@ -431,10 +422,14 @@ internal sealed class ResumableDownloadFileSession : IAsyncDisposable
         var existingLength = resumed ? GetTemporaryLength() : 0;
         var totalLength = ResolveTotalLength(response, existingLength, resumed);
         knownTotalLength = totalLength;
-        capacityLease?.SetExpectedSize(totalLength);
         sourceCandidateKey = candidateKey;
         strongETag = GetStrongETag(response);
         lastModified = GetLastModified(response);
+        await using var tail = prepareTail is not null
+            && totalLength is > MinecraftDownloadRequestExecutor.SegmentedSplitThreshold
+            && response.StatusCode == HttpStatusCode.OK && response.Content.Headers.ContentEncoding.Count == 0
+            ? prepareTail(totalLength.Value, strongETag, lastModified)
+            : null;
 
         var hashers = integrity.CreateHashers();
         try
@@ -444,25 +439,44 @@ internal sealed class ResumableDownloadFileSession : IAsyncDisposable
 
             await using var source = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
             EnsureManagedDestinationIsSafe();
-            await using var destination = OpenTemporaryFile(resumed);
+            await using var destination = OpenTemporaryFile(resumed, canRead: tail is not null);
             if (useHiddenTemporaryFile)
                 TryMarkTemporaryHidden(temporaryPath);
             var buffer = ArrayPool<byte>.Shared.Rent(BufferSize);
             var persisted = existingLength;
+            var verifiedWithTail = false;
             try
             {
                 while (true)
                 {
+                    if (tail?.TakeReadyTail(persisted) is { } suffix)
+                    {
+                        await using (suffix)
+                        {
+                            verifiedWithTail = await TryAppendTailAsync(destination, suffix, persisted, tail.Start,
+                                cancellationToken).ConfigureAwait(false);
+                        }
+                        if (verifiedWithTail)
+                        {
+                            tail.ReportUsed(totalLength!.Value - persisted);
+                            persisted = totalLength!.Value;
+                            reportAttemptProgress?.Invoke(attemptNumber, persisted, totalLength);
+                            break;
+                        }
+                    }
+
+                    var readStarted = tail?.Timestamp ?? 0;
                     var read = await ReadNetworkAsync(source, buffer, cancellationToken).ConfigureAwait(false);
                     if (read == 0)
                         break;
+                    var readDuration = tail?.GetElapsedTime(readStarted) ?? TimeSpan.Zero;
                     reportTransferredBytes?.Invoke(read);
-                    capacityLease?.BeforeWrite(read);
                     await WriteLocalAsync(destination, buffer, read, cancellationToken).ConfigureAwait(false);
                     foreach (var hasher in hashers.Values)
                         hasher.AppendData(buffer, 0, read);
                     persisted += read;
                     reportAttemptProgress?.Invoke(attemptNumber, persisted, integrity.ExpectedSize ?? totalLength);
+                    tail?.Observe(read, readDuration, persisted);
                 }
             }
             finally
@@ -472,10 +486,10 @@ internal sealed class ResumableDownloadFileSession : IAsyncDisposable
 
             await FlushLocalAsync(destination, cancellationToken).ConfigureAwait(false);
             ValidateCompletedLength(persisted, totalLength);
-            if (integrity.IsVerifiable && !integrity.Verify(hashers))
+            if (!verifiedWithTail && integrity.IsVerifiable && !integrity.Verify(hashers))
             {
                 DeleteTemporary();
-                throw new DownloadHashMismatchException("The downloaded file did not match its expected hash.");
+                throw integrity.DescribeFailure(new DownloadHashMismatchException("The downloaded file did not match its expected hash."));
             }
         }
         finally
@@ -487,6 +501,38 @@ internal sealed class ResumableDownloadFileSession : IAsyncDisposable
         Publish(cancellationToken);
     }
 
+    internal FileStream OpenTailFile()
+    {
+        var path = $"{temporaryPath}.{Guid.NewGuid():N}.tail";
+        if (managedRoot is not null)
+            MinecraftPathGuard.EnsureNoReparsePoints(managedRoot, path, "Download tail temporary file");
+        return new FileStream(path, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None, BufferSize,
+            FileOptions.Asynchronous | FileOptions.DeleteOnClose | FileOptions.SequentialScan);
+    }
+
+    private async Task<bool> TryAppendTailAsync(
+        FileStream destination, FileStream suffix, long persisted, long tailStart, CancellationToken cancellationToken)
+    {
+        try
+        {
+            suffix.Position = persisted - tailStart;
+            await suffix.CopyToAsync(destination, cancellationToken).ConfigureAwait(false);
+            await destination.FlushAsync(cancellationToken).ConfigureAwait(false);
+            destination.Flush(flushToDisk: true);
+            destination.Position = 0;
+            if (await integrity.VerifyStreamAsync(destination, cancellationToken).ConfigureAwait(false))
+                return true;
+        }
+        catch (IOException)
+        {
+            // The original response is still open and can finish the download.
+        }
+
+        destination.SetLength(persisted);
+        destination.Position = persisted;
+        return false;
+    }
+
     public async ValueTask DisposeAsync()
     {
         if (disposed)
@@ -495,7 +541,6 @@ internal sealed class ResumableDownloadFileSession : IAsyncDisposable
         segmentedDestination?.Dispose();
         segmentedDestination = null;
         DeleteTemporary();
-        capacityLease?.Dispose();
         assetLock?.Dispose();
         await Task.CompletedTask;
     }
@@ -519,7 +564,7 @@ internal sealed class ResumableDownloadFileSession : IAsyncDisposable
         if (total is null)
             return integrity.ExpectedSize;
         if (integrity.ExpectedSize.HasValue && integrity.ExpectedSize.Value != total.Value)
-            throw new DownloadContentValidationException("The response total length did not match the expected file size.");
+            throw SafeExceptionLog.Describe(new DownloadContentValidationException("The response total length did not match the expected file size."), "DownloadContentValidationException", ("Reason", "The response total length did not match the expected file size."), ("Artifact", temporaryPath), ("ExpectedBytes", integrity.ExpectedSize), ("ActualBytes", total.Value));
         return total;
     }
 
@@ -527,7 +572,7 @@ internal sealed class ResumableDownloadFileSession : IAsyncDisposable
     {
         var required = integrity.ExpectedSize ?? totalLength;
         if (required.HasValue && persisted != required.Value)
-            throw new DownloadBodyInterruptedException("The response body length did not match the expected file size.");
+            throw SafeExceptionLog.Describe(new DownloadBodyInterruptedException("The response body length did not match the expected file size."), "DownloadBodyInterruptedException", ("Reason", "The response body length did not match the expected file size."), ("Artifact", temporaryPath), ("ExpectedBytes", required.Value), ("ActualBytes", persisted));
     }
 
     private async Task<bool> VerifyTemporaryAsync(CancellationToken cancellationToken)
@@ -539,7 +584,7 @@ internal sealed class ResumableDownloadFileSession : IAsyncDisposable
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
-            throw new DownloadLocalFileException("Failed to verify the download temporary file.", exception);
+            throw SafeExceptionLog.Describe(new DownloadLocalFileException("Failed to verify the download temporary file.", exception), "DownloadLocalFileException", ("Reason", "Failed to verify the download temporary file."));
         }
     }
 
@@ -564,7 +609,7 @@ internal sealed class ResumableDownloadFileSession : IAsyncDisposable
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
-            throw new DownloadLocalFileException("Failed to read the download temporary file.", exception);
+            throw SafeExceptionLog.Describe(new DownloadLocalFileException("Failed to read the download temporary file.", exception), "DownloadLocalFileException", ("Reason", "Failed to read the download temporary file."));
         }
     }
 
@@ -590,7 +635,7 @@ internal sealed class ResumableDownloadFileSession : IAsyncDisposable
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
-            throw new DownloadLocalFileException("Failed to atomically publish the completed download.", exception);
+            throw SafeExceptionLog.Describe(new DownloadLocalFileException("Failed to atomically publish the completed download.", exception), "DownloadLocalFileException", ("Reason", "Failed to atomically publish the completed download."));
         }
     }
 
@@ -610,7 +655,7 @@ internal sealed class ResumableDownloadFileSession : IAsyncDisposable
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
-            throw new DownloadLocalFileException("Failed to inspect the download temporary file.", exception);
+            throw SafeExceptionLog.Describe(new DownloadLocalFileException("Failed to inspect the download temporary file.", exception), "DownloadLocalFileException", ("Reason", "Failed to inspect the download temporary file."));
         }
     }
 
@@ -621,29 +666,28 @@ internal sealed class ResumableDownloadFileSession : IAsyncDisposable
             if (managedRoot is not null)
                 MinecraftPathGuard.EnsureNoReparsePoints(managedRoot, temporaryPath, "Managed download source switch");
             File.Delete(temporaryPath);
-            capacityLease?.DiscardRetainedBytes();
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
-            throw new DownloadLocalFileException("Failed to discard an incompatible partial download.", exception);
+            throw SafeExceptionLog.Describe(new DownloadLocalFileException("Failed to discard an incompatible partial download.", exception), "DownloadLocalFileException", ("Reason", "Failed to discard an incompatible partial download."));
         }
     }
 
-    private FileStream OpenTemporaryFile(bool resumed)
+    private FileStream OpenTemporaryFile(bool resumed, bool canRead = false)
     {
         try
         {
             return new FileStream(
                 temporaryPath,
                 resumed ? FileMode.Append : FileMode.Create,
-                FileAccess.Write,
+                canRead ? FileAccess.ReadWrite : FileAccess.Write,
                 FileShare.None,
                 BufferSize,
                 FileOptions.Asynchronous | FileOptions.SequentialScan);
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
-            throw new DownloadLocalFileException("Failed to open the download temporary file.", exception);
+            throw SafeExceptionLog.Describe(new DownloadLocalFileException("Failed to open the download temporary file.", exception), "DownloadLocalFileException", ("Reason", "Failed to open the download temporary file."));
         }
     }
 
@@ -655,7 +699,7 @@ internal sealed class ResumableDownloadFileSession : IAsyncDisposable
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
-            throw new DownloadLocalFileException("Failed to write the download temporary file.", exception);
+            throw SafeExceptionLog.Describe(new DownloadLocalFileException("Failed to write the download temporary file.", exception), "DownloadLocalFileException", ("Reason", "Failed to write the download temporary file."));
         }
     }
 
@@ -669,7 +713,7 @@ internal sealed class ResumableDownloadFileSession : IAsyncDisposable
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
-            throw new DownloadLocalFileException("Failed to flush the download temporary file.", exception);
+            throw SafeExceptionLog.Describe(new DownloadLocalFileException("Failed to flush the download temporary file.", exception), "DownloadLocalFileException", ("Reason", "Failed to flush the download temporary file."));
         }
     }
 
@@ -682,7 +726,6 @@ internal sealed class ResumableDownloadFileSession : IAsyncDisposable
             if (managedRoot is not null)
                 MinecraftPathGuard.EnsureNoReparsePoints(managedRoot, temporaryPath, "Managed download cleanup");
             File.Delete(temporaryPath);
-            capacityLease?.DiscardRetainedBytes();
         }
         catch (InvalidDataException) { }
         catch (IOException) { }
@@ -745,7 +788,7 @@ internal sealed class ResumableDownloadFileSession : IAsyncDisposable
         try { return await source.ReadAsync(buffer, cancellationToken).ConfigureAwait(false); }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
         catch (Exception exception) when (exception is IOException or HttpRequestException or OperationCanceledException)
-        { throw new DownloadBodyInterruptedException("The response body was interrupted while downloading a file.", exception); }
+        { throw SafeExceptionLog.Describe(new DownloadBodyInterruptedException("The response body was interrupted while downloading a file.", exception), "DownloadBodyInterruptedException", ("Reason", "The response body was interrupted while downloading a file.")); }
     }
 
     private static IDisposable AcquireFinalPublishLock(string path, CancellationToken cancellationToken)

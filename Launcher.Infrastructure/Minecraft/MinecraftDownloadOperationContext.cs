@@ -8,6 +8,8 @@ using System.Collections.Concurrent;
 using System.IO;
 using System.Security.Cryptography;
 
+using Launcher.Application.Services;
+
 namespace Launcher.Infrastructure.Minecraft;
 
 /// <summary>
@@ -45,6 +47,8 @@ internal sealed class MinecraftDownloadOperationContext : IDisposable
     }
 
     public string ManagedRoot { get; }
+    internal DownloadHostHealthTracker HostHealth { get; } = new();
+    internal VerifiedVanillaClient? ReusableVanillaClient { get; set; }
 
     public string ResolveManagedRoot(string destinationPath)
     {
@@ -61,6 +65,7 @@ internal sealed class MinecraftDownloadOperationContext : IDisposable
 
     public void Dispose()
     {
+        HostHealth.Clear();
     }
 
     public void RegisterAsset(string destinationPath, string sha1, long? size)
@@ -68,7 +73,7 @@ internal sealed class MinecraftDownloadOperationContext : IDisposable
         var normalized = Path.GetFullPath(destinationPath);
         var identity = new AssetIdentity(sha1, size);
         if (assets.TryGetValue(normalized, out var existing) && existing != identity)
-            throw new InvalidDataException("Conflicting asset identities resolved to the same destination path.");
+            throw SafeExceptionLog.Describe(new InvalidDataException("Conflicting asset identities resolved to the same destination path."), "DownloadValidation", ("Reason", "Conflicting asset identities resolved to the same destination path."));
         assets[normalized] = identity;
     }
 
@@ -79,6 +84,8 @@ internal sealed class MinecraftDownloadOperationContext : IDisposable
             && string.Equals(expected.Sha1, sha1, StringComparison.OrdinalIgnoreCase)
             && expected.Size == size;
     }
+
+    internal bool HasRegisteredAsset(string normalizedDestination) => assets.ContainsKey(normalizedDestination);
 
     public bool IsVerified(string destinationPath, DownloadIntegrityExpectation integrity)
     {
@@ -131,3 +138,5 @@ internal sealed class MinecraftDownloadOperationContext : IDisposable
         public void Dispose() => Interlocked.Exchange(ref semaphore, null)?.Release();
     }
 }
+
+internal sealed record VerifiedVanillaClient(string Path, string Sha1, long Size);

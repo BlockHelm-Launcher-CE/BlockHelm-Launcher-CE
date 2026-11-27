@@ -17,6 +17,7 @@
  * SPDX-License-Identifier: GPL-3.0-only
  */
 
+using System.Collections.Specialized;
 using Launcher.App.ViewModels.Resources;
 using Launcher.Application.Services;
 using Launcher.Domain.Models;
@@ -25,6 +26,24 @@ namespace Launcher.Tests.ViewModels.Resources;
 
 public sealed class ResourcesProjectVersionsViewModelTests
 {
+    [Fact]
+    public void CatalogRefreshRebindsSelectedResourceTargetAndRemovesRenamedDirectory()
+    {
+        using var page = new ResourcesPageViewModel().ModPage;
+        var viewModel = page.Versions;
+        PrepareProject(viewModel);
+        var original = new GameInstance { InstanceDirectory = @"C:\game\versions\A", Name = "A", MinecraftVersion = "1.20.1", Loader = LoaderKind.Fabric };
+        viewModel.RefreshInstanceCatalog([original]);
+        viewModel.SelectedTarget = Assert.Single(viewModel.InstallTargets, target => target.Instance is not null);
+        var refreshed = new GameInstance { InstanceDirectory = original.InstanceDirectory, Name = "A", MinecraftVersion = "1.20.1", Loader = LoaderKind.Fabric, Description = "external" };
+        Assert.False(viewModel.RefreshInstanceCatalog([refreshed]));
+        Assert.Same(refreshed, viewModel.SelectedTarget!.Instance);
+        var renamed = new GameInstance { InstanceDirectory = @"C:\game\versions\B", Name = "B", Loader = LoaderKind.Fabric };
+        Assert.True(viewModel.RefreshInstanceCatalog([renamed]));
+        Assert.Null(viewModel.SelectedTarget);
+        Assert.Same(renamed, Assert.Single(viewModel.InstallTargets, target => target.Instance is not null).Instance);
+    }
+
     [Fact]
     public async Task MultipleCompatibilityGroupsStartCollapsedAndCanBeExpanded()
     {
@@ -136,7 +155,7 @@ public sealed class ResourcesProjectVersionsViewModelTests
         Assert.Empty(viewModel.ListItems.OfType<ResourcesModVersionItemViewModel>());
         Assert.Equal(52, Assert.Single(viewModel.ListItems.OfType<ResourcesGroupCollapseSpacerItem>()).Height);
 
-        await Task.Delay(400);
+        await WaitForListChangeAsync(viewModel, () => !viewModel.ListItems.OfType<ResourcesGroupCollapseSpacerItem>().Any());
         Assert.Empty(viewModel.ListItems.OfType<ResourcesGroupCollapseSpacerItem>());
 
         header.ToggleExpandedCommand.Execute(null);
@@ -204,7 +223,7 @@ public sealed class ResourcesProjectVersionsViewModelTests
         Assert.Empty(viewModel.ListItems.OfType<ResourcesModVersionItemViewModel>());
         Assert.Equal(1040, Assert.Single(viewModel.ListItems.OfType<ResourcesGroupCollapseSpacerItem>()).Height);
 
-        await Task.Delay(400);
+        await WaitForListChangeAsync(viewModel, () => !viewModel.ListItems.OfType<ResourcesGroupCollapseSpacerItem>().Any());
         Assert.Empty(viewModel.ListItems.OfType<ResourcesGroupCollapseSpacerItem>());
 
         header.ToggleExpandedCommand.Execute(null);
@@ -233,7 +252,7 @@ public sealed class ResourcesProjectVersionsViewModelTests
         Assert.Equal(20, queuedChildren);
         Assert.All(firstRows, row => Assert.True(row.IsGroupEntrancePending));
 
-        await Task.Delay(700);
+        await WaitForListChangeAsync(viewModel, () => viewModel.ListItems.OfType<ResourcesModVersionItemViewModel>().Count() == 25);
         var allRows = viewModel.ListItems.OfType<ResourcesModVersionItemViewModel>().ToList();
         Assert.Equal(25, allRows.Count);
         Assert.Same(firstRows[0], allRows[0]);
@@ -264,7 +283,7 @@ public sealed class ResourcesProjectVersionsViewModelTests
         header.ToggleExpandedCommand.Execute(null);
 
         Assert.Equal(7, viewModel.ListItems.OfType<ResourcesModVersionItemViewModel>().Count());
-        await Task.Delay(600);
+        await WaitForListChangeAsync(viewModel, () => viewModel.ListItems.OfType<ResourcesModVersionItemViewModel>().Count() == 25);
         Assert.Equal(25, viewModel.ListItems.OfType<ResourcesModVersionItemViewModel>().Count());
 
         Action? completeCollapse = null;
@@ -300,7 +319,7 @@ public sealed class ResourcesProjectVersionsViewModelTests
 
         var currentChild = viewModel.ListItems.OfType<ResourcesModVersionItemViewModel>().First();
         Assert.NotSame(firstChild, currentChild);
-        await Task.Delay(650);
+        await WaitForListChangeAsync(viewModel, () => viewModel.ListItems.OfType<ResourcesModVersionItemViewModel>().Count() == 25);
         var children = viewModel.ListItems.OfType<ResourcesModVersionItemViewModel>().ToList();
         Assert.Equal(25, children.Count);
         Assert.Same(currentChild, children[0]);
@@ -342,7 +361,7 @@ public sealed class ResourcesProjectVersionsViewModelTests
         PrepareProject(viewModel);
         viewModel.SelectedTarget = ResourcesModInstallTargetItemViewModel.FromInstance(new GameInstance
         {
-            Id = "fabric-instance",
+
             MinecraftVersion = "1.21.3",
             Loader = LoaderKind.Fabric
         });
@@ -406,6 +425,27 @@ public sealed class ResourcesProjectVersionsViewModelTests
         Assert.False(viewModel.IsLoading);
         Assert.True(viewModel.CanShowLoadErrorState);
         Assert.True(viewModel.RefreshCommand.CanExecute(null));
+    }
+
+    private static async Task WaitForListChangeAsync(ResourcesProjectVersionsViewModel viewModel, Func<bool> isReady)
+    {
+        var ready = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        void Check(object? sender, NotifyCollectionChangedEventArgs args)
+        {
+            if (isReady())
+                ready.TrySetResult();
+        }
+
+        viewModel.ListItems.CollectionChanged += Check;
+        try
+        {
+            if (!isReady())
+                await ready.Task.WaitAsync(TimeSpan.FromSeconds(15));
+        }
+        finally
+        {
+            viewModel.ListItems.CollectionChanged -= Check;
+        }
     }
 
     private static void PrepareLocalDownloadTarget(ResourcesProjectVersionsViewModel viewModel)

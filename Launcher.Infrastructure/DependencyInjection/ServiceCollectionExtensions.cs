@@ -52,6 +52,7 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<ICurseForgeApiKeyResolver, CurseForgeApiKeyResolver>();
         services.AddSingleton<IMcresBhlApiKeyResolver, McresBhlApiKeyResolver>();
         services.AddSingleton<ISettingsService, JsonSettingsService>();
+        services.AddSingleton(_ => AutomaticDownloadSourceSelector.Shared);
         services.AddSingleton<IMinecraftDirectoryFileSystem, MinecraftDirectoryFileSystem>();
         services.AddSingleton<IMinecraftDirectoryDiscoveryService, MinecraftDirectoryDiscoveryService>();
         services.AddSingleton<IAccountStateService, JsonAccountStateService>();
@@ -97,7 +98,11 @@ public static class ServiceCollectionExtensions
             serviceProvider.GetService<IDownloadSpeedLimitState>(),
             serviceProvider.GetService<Microsoft.Extensions.Logging.ILogger<GameFileIntegrityService>>(),
             serviceProvider.GetServices<ILoaderFileManifestContributor>()));
-        services.AddSingleton<ILaunchService, LaunchService>();
+        services.AddSingleton<InstanceActivityCoordinator>();
+        services.AddSingleton<LaunchService>();
+        services.AddSingleton<ILaunchService>(provider => new CoordinatedLaunchService(
+            provider.GetRequiredService<LaunchService>(), provider.GetRequiredService<InstanceActivityCoordinator>()));
+        services.AddSingleton<IInstanceCleanupService, InstanceCleanupService>();
         services.AddSingleton<ILaunchDiagnosticExportService, LaunchDiagnosticExportService>();
         services.AddSingleton<IGameLanguageService, GameLanguageService>();
         services.AddSingleton<IJavaRuntimeDiscoveryService, JavaRuntimeDiscoveryService>();

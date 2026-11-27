@@ -29,7 +29,8 @@ internal sealed record ForgeInstallerPlan(
     IReadOnlyList<ForgeInstallerLibrary> PrerequisiteLibraries,
     IReadOnlyList<ForgeInstallerLibrary> RuntimeLibraries,
     IReadOnlyList<ForgeProcessorOutput> ProcessorOutputs,
-    JsonArray RuntimeLibraryMetadata)
+    JsonArray RuntimeLibraryMetadata,
+    string? ServerJarPath = null)
 {
     public IEnumerable<ForgeInstallerLibrary> AllLibraries => PrerequisiteLibraries.Concat(RuntimeLibraries);
 }
@@ -71,7 +72,7 @@ internal sealed partial class LoaderInstallerArtifactService
         await using var installerStream = new FileStream(
             installerJarPath, FileMode.Open, FileAccess.Read, FileShare.Read, 128 * 1024,
             FileOptions.Asynchronous | FileOptions.SequentialScan);
-        using var archive = new ZipArchive(installerStream, ZipArchiveMode.Read, leaveOpen: false);
+        using var archive = OpenInstallerArchive(installerStream, installerJarPath);
         var profile = await ReadObjectAsync(archive, "install_profile.json", required: true, cancellationToken).ConfigureAwait(false);
         var installerVersion = await ReadObjectAsync(archive, "version.json", required: false, cancellationToken).ConfigureAwait(false);
 
@@ -97,7 +98,8 @@ internal sealed partial class LoaderInstallerArtifactService
             prerequisiteLibraries.Values.OrderBy(item => item.Artifact.RelativePath, StringComparer.OrdinalIgnoreCase).ToArray(),
             runtimeLibraries.Values.OrderBy(item => item.Artifact.RelativePath, StringComparer.OrdinalIgnoreCase).ToArray(),
             processorOutputs.OrderBy(item => item.RelativePath, StringComparer.OrdinalIgnoreCase).ToArray(),
-            (JsonArray)runtimeMetadata.DeepClone());
+            (JsonArray)runtimeMetadata.DeepClone(),
+            environment is ModpackInstallEnvironment.Server ? MappingString(profile["serverJarPath"]) : null);
     }
 
     public async Task MaterializePrerequisitesAsync(
@@ -108,10 +110,27 @@ internal sealed partial class LoaderInstallerArtifactService
         int downloadSpeedLimitMbPerSecond,
         CancellationToken cancellationToken,
         MinecraftDownloadOperationContext? operationContext = null,
-        SpeedMeter? speedMeter = null)
+        SpeedMeter? speedMeter = null,
+        bool parallelDownloads = false,
+        Func<string, bool>? includeLibrary = null)
     {
-        await MaterializeLibrariesAsync(installerJarPath, plan.PrerequisiteLibraries, minecraftDirectory,
-            downloadSourcePreference, downloadSpeedLimitMbPerSecond, cancellationToken, operationContext, speedMeter).ConfigureAwait(false);
+        var declaredRuntimeUrls = plan.RuntimeLibraryMetadata.OfType<JsonObject>()
+            .Select(library => (library["downloads"] as JsonObject)?["artifact"] as JsonObject)
+            .Select(artifact => MappingString(artifact?["url"]))
+            .OfType<string>()
+            .ToHashSet(StringComparer.Ordinal);
+        var unavailablePaths = plan.PrerequisiteLibraries.Select(library => library.Artifact.RelativePath)
+            .Concat(plan.ProcessorOutputs.Select(output => output.RelativePath))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        // Java also reads libraries declared in version.json before starting its processors.
+        var javaRuntimeLibraries = plan.RuntimeLibraries.Where(library => !unavailablePaths.Contains(library.Artifact.RelativePath)
+            && (library.EmbeddedEntryName is not null
+                || MinecraftFileIntegrity.IsSha1(library.Artifact.Sha1) && declaredRuntimeUrls.Contains(library.Artifact.Url)));
+        var libraries = plan.PrerequisiteLibraries.Concat(javaRuntimeLibraries);
+        if (includeLibrary is not null)
+            libraries = libraries.Where(library => includeLibrary(library.Artifact.RelativePath));
+        await MaterializeLibrariesAsync(installerJarPath, libraries, minecraftDirectory,
+            downloadSourcePreference, downloadSpeedLimitMbPerSecond, cancellationToken, operationContext, speedMeter, parallelDownloads).ConfigureAwait(false);
     }
 
     public async Task MaterializeRuntimeLibrariesAsync(
@@ -122,17 +141,19 @@ internal sealed partial class LoaderInstallerArtifactService
         int downloadSpeedLimitMbPerSecond,
         CancellationToken cancellationToken,
         MinecraftDownloadOperationContext? operationContext = null,
-        SpeedMeter? speedMeter = null)
+        SpeedMeter? speedMeter = null,
+        bool parallelDownloads = false)
     {
         await MaterializeLibrariesAsync(installerJarPath, plan.RuntimeLibraries, minecraftDirectory,
-            downloadSourcePreference, downloadSpeedLimitMbPerSecond, cancellationToken, operationContext, speedMeter).ConfigureAwait(false);
+            downloadSourcePreference, downloadSpeedLimitMbPerSecond, cancellationToken, operationContext, speedMeter, parallelDownloads).ConfigureAwait(false);
     }
 
-    public async Task ValidatePublishedArtifactsAsync(
+    public async Task<IReadOnlyDictionary<string, ProcessorOutputInspection>> ValidatePublishedArtifactsAsync(
         string minecraftDirectory,
         ForgeInstallerPlan plan,
         CancellationToken cancellationToken,
-        MinecraftDownloadOperationContext? operationContext = null)
+        MinecraftDownloadOperationContext? operationContext = null,
+        IReadOnlyDictionary<string, ProcessorOutputInspection>? previouslyInspectedOutputs = null)
     {
         var fullHashVerificationCount = 0;
         var currentOperationVerificationReuseCount = 0;
@@ -152,19 +173,37 @@ internal sealed partial class LoaderInstallerArtifactService
                 fullHashVerificationCount++;
         }
 
-        foreach (var output in plan.ProcessorOutputs)
+        var libraryPaths = plan.AllLibraries.Select(library => library.Artifact.RelativePath)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var inspectedOutputs = new Dictionary<string, ProcessorOutputInspection>(StringComparer.OrdinalIgnoreCase);
+        foreach (var output in plan.ProcessorOutputs.Where(output => !libraryPaths.Contains(output.RelativePath)))
         {
             var path = ResolveLibraryPath(minecraftDirectory, output.RelativePath);
-            await EnsureValidAsync(path, output.TrustedSha1, expectedSize: null, "Forge processor output", cancellationToken)
-                .ConfigureAwait(false);
+            if (previouslyInspectedOutputs is not null)
+            {
+                var previous = previouslyInspectedOutputs[output.RelativePath];
+                await EnsureValidAsync(path, expectedSha1: null, previous.Size, "Forge processor output",
+                    cancellationToken, MinecraftFileVerification.SizeOnly).ConfigureAwait(false);
+                inspectedOutputs.Add(output.RelativePath, previous);
+                continue;
+            }
+            var inspection = await ProcessorOutputInspector.InspectAsync(path, output, cancellationToken).ConfigureAwait(false);
+            inspectedOutputs.Add(output.RelativePath, inspection);
             if (MinecraftFileIntegrity.IsSha1(output.TrustedSha1))
+            {
                 fullHashVerificationCount++;
+                if (inspection.VerificationLevel == GameFileVerificationLevel.SizeVerified)
+                    logger.LogWarning(
+                        "Generated loader output accepted after structural validation despite a declared hash mismatch. Artifact={Artifact} ExpectedHash={ExpectedHash} ActualHash={ActualHash} ActualSize={ActualSize} VerificationLevel={VerificationLevel} Stage={Stage}",
+                        output.RelativePath, output.TrustedSha1, inspection.Sha1, inspection.Size, inspection.VerificationLevel, "ArtifactValidation");
+            }
         }
 
         logger.LogDebug(
             "Loader installer artifact validation completed. FullHashVerificationCount={FullHashVerificationCount} CurrentOperationVerificationReuseCount={CurrentOperationVerificationReuseCount}",
             fullHashVerificationCount,
             currentOperationVerificationReuseCount);
+        return inspectedOutputs;
     }
 
     public static IReadOnlyDictionary<string, VerifiedSharedFileExpectation> CreateTrustedSharedLibraryExpectations(
@@ -181,7 +220,7 @@ internal sealed partial class LoaderInstallerArtifactService
                 && (!string.Equals(existing.Sha1, expectation.Sha1, StringComparison.OrdinalIgnoreCase)
                     || existing.Size != expectation.Size))
             {
-                throw new InvalidDataException($"Forge installer plan contains conflicting expectations for {relativePath}.");
+                throw SafeExceptionLog.Describe(new InvalidDataException($"Forge installer plan contains conflicting expectations for {relativePath}."), "ConflictingInstallerExpectations", ("Artifact", relativePath), ("ExpectedHash", expectation.Sha1), ("ExistingHash", existing.Sha1), ("ExpectedSize", expectation.Size), ("ExistingSize", existing.Size));
             }
 
             expectations[relativePath] = expectation;
@@ -191,13 +230,13 @@ internal sealed partial class LoaderInstallerArtifactService
     }
 
     public static IReadOnlyDictionary<string, string?> CreateReplaceableProcessorOutputExpectations(
-        ForgeInstallerPlan plan)
+        IReadOnlyDictionary<string, ProcessorOutputInspection> inspectedOutputs)
     {
         var expectations = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
-        foreach (var output in plan.ProcessorOutputs
+        foreach (var output in inspectedOutputs.Values
                      .OrderBy(output => output.RelativePath, StringComparer.OrdinalIgnoreCase))
         {
-            expectations[$"libraries/{output.RelativePath.Replace('\\', '/')}"] = output.TrustedSha1;
+            expectations[$"libraries/{output.RelativePath.Replace('\\', '/')}"] = output.Sha1;
         }
 
         return expectations;
@@ -230,33 +269,63 @@ internal sealed partial class LoaderInstallerArtifactService
         int downloadSpeedLimitMbPerSecond,
         CancellationToken cancellationToken,
         MinecraftDownloadOperationContext? operationContext,
-        SpeedMeter? speedMeter)
+        SpeedMeter? speedMeter,
+        bool parallelDownloads = false)
     {
+        var uniqueLibraries = libraries.DistinctBy(library => library.Artifact.RelativePath, StringComparer.OrdinalIgnoreCase).ToArray();
         var archiveEntries = new Dictionary<string, ZipArchiveEntry>(StringComparer.OrdinalIgnoreCase);
+        var hostHealth = operationContext?.HostHealth ?? new DownloadHostHealthTracker();
         await using (var stream = new FileStream(installerJarPath, FileMode.Open, FileAccess.Read, FileShare.Read, 128 * 1024,
                          FileOptions.Asynchronous | FileOptions.SequentialScan))
         using (var archive = new ZipArchive(stream, ZipArchiveMode.Read, leaveOpen: false))
         {
-            foreach (var library in libraries.Where(item => item.EmbeddedEntryName is not null))
+            foreach (var library in uniqueLibraries.Where(item => item.EmbeddedEntryName is not null))
             {
                 var entry = archive.GetEntry(library.EmbeddedEntryName!);
                 if (entry is null || entry.Length == 0)
-                    throw new InvalidDataException($"Forge installer embedded library is missing: {library.Artifact.RelativePath}");
+                    throw SafeExceptionLog.Describe(new InvalidDataException($"Forge installer embedded library is missing: {library.Artifact.RelativePath}"), "EmbeddedLibraryMissing", ("Artifact", library.Artifact.RelativePath), ("ArchiveEntry", library.EmbeddedEntryName));
                 archiveEntries[library.Artifact.RelativePath] = entry;
             }
 
-            foreach (var library in libraries)
+            if (parallelDownloads)
             {
-                cancellationToken.ThrowIfCancellationRequested();
+                // ZipArchive shares its underlying stream. Only distinct remote files run concurrently.
+                foreach (var library in uniqueLibraries.Where(item => item.EmbeddedEntryName is not null))
+                    await MaterializeAsync(library, cancellationToken).ConfigureAwait(false);
+                await Parallel.ForEachAsync(
+                    uniqueLibraries.Where(item => item.EmbeddedEntryName is null),
+                    new ParallelOptions { CancellationToken = cancellationToken, MaxDegreeOfParallelism = 8 },
+                    async (library, token) => await MaterializeAsync(library, token).ConfigureAwait(false))
+                    .ConfigureAwait(false);
+            }
+            else
+            {
+                foreach (var library in uniqueLibraries)
+                    await MaterializeAsync(library, cancellationToken).ConfigureAwait(false);
+            }
+
+            async Task MaterializeAsync(ForgeInstallerLibrary library, CancellationToken token)
+            {
+                token.ThrowIfCancellationRequested();
                 var destinationPath = ResolveLibraryPath(minecraftDirectory, library.Artifact.RelativePath);
                 using var verifiedLease = AcquireCurrentOperationVerificationLease(destinationPath, library.Artifact, operationContext);
                 var verification = verifiedLease is not null
                     ? MinecraftFileVerification.SizeOnly
                     : MinecraftFileVerification.Full;
-                var status = await MinecraftFileIntegrity.EvaluateAsync(destinationPath, library.Artifact.Sha1, library.Artifact.Size,
-                    verification, cancellationToken).ConfigureAwait(false);
-                if (status == MinecraftFileIntegrityStatus.Valid)
-                    continue;
+                // Hold the file stable between full validation and recording its snapshot.
+                // Release this guard before attempting a replacement of an invalid file.
+                using (var validationLease = verifiedLease is null && operationContext is not null
+                           ? WindowsFileSnapshot.TryAcquire(destinationPath) : null)
+                {
+                    var status = await MinecraftFileIntegrity.EvaluateAsync(destinationPath, library.Artifact.Sha1, library.Artifact.Size,
+                        verification, token).ConfigureAwait(false);
+                    if (status == MinecraftFileIntegrityStatus.Valid)
+                    {
+                        if (validationLease is not null)
+                            MarkVerified(destinationPath, library.Artifact, operationContext);
+                        return;
+                    }
+                }
 
                 if (archiveEntries.TryGetValue(library.Artifact.RelativePath, out var entry))
                 {
@@ -265,14 +334,15 @@ internal sealed partial class LoaderInstallerArtifactService
                         destinationPath,
                         library.Artifact,
                         minecraftDirectory,
-                        cancellationToken,
+                        token,
                         operationContext).ConfigureAwait(false);
-                    continue;
+                    return;
                 }
 
                 var executor = new MinecraftDownloadRequestExecutor(httpClient, logger,
                     DownloadBandwidthLimiter.Create(downloadSpeedLimitMbPerSecond, downloadSpeedLimitState),
-                    category: DownloadConcurrencyCategory.Runtime);
+                    category: DownloadConcurrencyCategory.Runtime,
+                    hostHealthTracker: hostHealth);
                 var logScope = new ForegroundDownloadLogScope(
                     logger,
                     "ForgeInstall",
@@ -280,6 +350,7 @@ internal sealed partial class LoaderInstallerArtifactService
                     destinationPath,
                     library.Artifact.Url,
                     library.Artifact.Size);
+                using var diagnosticLogScope = logScope.RestoreContext();
                 try
                 {
                     var resolution = await executor.DownloadFileAsync(
@@ -289,7 +360,7 @@ internal sealed partial class LoaderInstallerArtifactService
                         destinationPath,
                         library.Artifact.Sha1,
                         library.Artifact.Size,
-                        cancellationToken,
+                        token,
                         reportAttemptProgress: logScope.BeginSource(),
                         options: CreateDownloadOptions(library.Artifact, operationContext, minecraftDirectory),
                         speedMeter: speedMeter,
@@ -355,10 +426,10 @@ internal sealed partial class LoaderInstallerArtifactService
         CancellationToken cancellationToken,
         MinecraftFileVerification verification = MinecraftFileVerification.Full)
     {
-        var status = await MinecraftFileIntegrity.EvaluateAsync(path, expectedSha1, expectedSize, verification, cancellationToken)
+        var result = await MinecraftFileIntegrity.InspectAsync(path, expectedSha1, expectedSize, verification, cancellationToken)
             .ConfigureAwait(false);
-        if (status != MinecraftFileIntegrityStatus.Valid)
-            throw new InvalidDataException($"{kind} is missing or invalid ({status}): {path}");
+        if (result.Status != MinecraftFileIntegrityStatus.Valid)
+            throw result.CreateException(path, kind);
     }
 
     private static DownloadFileOptions? CreateDownloadOptions(
@@ -399,18 +470,27 @@ internal sealed partial class LoaderInstallerArtifactService
         }
     }
 
+    private static ZipArchive OpenInstallerArchive(Stream stream, string installerPath)
+    {
+        try { return new ZipArchive(stream, ZipArchiveMode.Read, leaveOpen: false); }
+        catch (InvalidDataException exception)
+        {
+            throw SafeExceptionLog.Describe(exception, "InstallerArchiveInvalid", ("Artifact", installerPath), ("ExpectedFormat", "JAR/ZIP"));
+        }
+    }
+
     private static async Task<JsonObject> ReadObjectAsync(ZipArchive archive, string entryName, bool required, CancellationToken cancellationToken)
     {
         var entry = archive.GetEntry(entryName);
         if (entry is null)
         {
             if (required)
-                throw new InvalidDataException($"Forge installer does not contain {entryName}.");
+                throw SafeExceptionLog.Describe(new InvalidDataException($"Forge installer does not contain {entryName}."), "InstallerEntryMissing", ("Entry", entryName));
             return new JsonObject();
         }
         await using var stream = entry.Open();
         return await JsonNode.ParseAsync(stream, cancellationToken: cancellationToken).ConfigureAwait(false) as JsonObject
-            ?? throw new InvalidDataException($"Forge installer {entryName} is empty or invalid.");
+            ?? throw SafeExceptionLog.Describe(new InvalidDataException($"Forge installer {entryName} is empty or invalid."), "InstallerEntryInvalid", ("Entry", entryName));
     }
 
     private static void AddLibraries(
@@ -426,7 +506,7 @@ internal sealed partial class LoaderInstallerArtifactService
                 continue;
             var resolved = ManagedLibraryArtifactResolver.EnumerateDownloads(library).ToList();
             if (resolved.Count == 0)
-                throw new InvalidDataException($"Forge installer library cannot be resolved: {library["name"]?.GetValue<string>() ?? library.ToJsonString()}");
+                throw SafeExceptionLog.Describe(new InvalidDataException("Forge installer library cannot be resolved."), "InstallerLibraryUnresolvable", ("MetadataField", "libraries.name/downloads"));
             foreach (var artifact in resolved)
                 AddLibrary(artifact, embeddedEntries, destination);
         }
@@ -549,7 +629,7 @@ internal sealed partial class LoaderInstallerArtifactService
                 out var relativePath)
             || !IsSafeRelativePath(relativePath))
         {
-            throw new InvalidDataException($"Forge processor input cannot be resolved: {expression}");
+            throw SafeExceptionLog.Describe(new InvalidDataException($"Forge processor input cannot be resolved: {expression}"), "ProcessorInputUnresolvable", ("MetadataField", "processors.args"));
         }
         if (outputs.ContainsKey(relativePath))
             return;
@@ -560,7 +640,7 @@ internal sealed partial class LoaderInstallerArtifactService
         IDictionary<string, ForgeInstallerLibrary> destination)
     {
         if (!IsSafeRelativePath(artifact.RelativePath))
-            throw new InvalidDataException($"Forge installer declared an unsafe library path: {artifact.RelativePath}");
+            throw SafeExceptionLog.Describe(new InvalidDataException($"Forge installer declared an unsafe library path: {artifact.RelativePath}"), "UnsafeInstallerLibraryPath", ("Artifact", artifact.RelativePath));
         var normalizedPath = artifact.RelativePath.Replace('\\', '/');
         embeddedEntries.TryGetValue(normalizedPath, out var embeddedEntryName);
         var candidate = new ForgeInstallerLibrary(artifact with { RelativePath = normalizedPath }, embeddedEntryName);
@@ -572,7 +652,7 @@ internal sealed partial class LoaderInstallerArtifactService
         if (!Compatible(existing.Artifact.Sha1, candidate.Artifact.Sha1)
             || !Compatible(existing.Artifact.Size, candidate.Artifact.Size))
         {
-            throw new InvalidDataException($"Forge installer declared conflicting library metadata: {normalizedPath}");
+            throw SafeExceptionLog.Describe(new InvalidDataException($"Forge installer declared conflicting library metadata: {normalizedPath}"), "ConflictingInstallerLibraryMetadata", ("Artifact", normalizedPath), ("ExistingHash", existing.Artifact.Sha1), ("IncomingHash", candidate.Artifact.Sha1), ("ExistingSize", existing.Artifact.Size), ("IncomingSize", candidate.Artifact.Size));
         }
         var selected = new ManagedLibraryArtifact(
             existing.Artifact.Url,
@@ -618,7 +698,7 @@ internal sealed partial class LoaderInstallerArtifactService
         if (coordinateExpression.Length < 3 || coordinateExpression[0] != '[' || coordinateExpression[^1] != ']'
             || !ManagedLibraryArtifactResolver.TryBuildMavenPath(coordinateExpression[1..^1], classifierOverride: null, out var relativePath)
             || !IsSafeRelativePath(relativePath))
-            throw new InvalidDataException($"Forge processor output cannot be resolved: {pathExpression}");
+            throw SafeExceptionLog.Describe(new InvalidDataException($"Forge processor output cannot be resolved: {pathExpression}"), "ProcessorOutputUnresolvable", ("MetadataField", "processors.outputs"));
         var resolvedHash = TrimLiteral(ResolveExpression(hashExpression, data));
         if (!MinecraftFileIntegrity.IsSha1(resolvedHash) && token is not null && data.TryGetValue($"{token}_SHA", out var tokenHash))
             resolvedHash = TrimLiteral(tokenHash);
@@ -628,7 +708,7 @@ internal sealed partial class LoaderInstallerArtifactService
         if (isPatchedOutput)
             resolvedHash = null;
         if (outputs.TryGetValue(relativePath, out var existing) && !Compatible(existing.TrustedSha1, resolvedHash))
-            throw new InvalidDataException($"Forge processor declared conflicting output checksums: {relativePath}");
+            throw SafeExceptionLog.Describe(new InvalidDataException($"Forge processor declared conflicting output checksums: {relativePath}"), "ConflictingProcessorOutputHashes", ("Artifact", relativePath), ("ExistingHash", existing.TrustedSha1), ("IncomingHash", resolvedHash));
         outputs[relativePath] = new ForgeProcessorOutput(
             relativePath,
             isPatchedOutput
@@ -691,7 +771,7 @@ internal sealed partial class LoaderInstallerArtifactService
             16 * 1024,
             FileOptions.Asynchronous | FileOptions.SequentialScan);
         return await JsonNode.ParseAsync(stream, cancellationToken: cancellationToken).ConfigureAwait(false) as JsonObject
-            ?? throw new InvalidDataException($"Version metadata is empty: {versionJsonPath}");
+            ?? throw SafeExceptionLog.Describe(new InvalidDataException($"Version metadata is empty: {versionJsonPath}"), "VersionMetadataEmpty", ("Artifact", versionJsonPath));
     }
 
     private static bool RunsOnSide(JsonObject processor, ModpackInstallEnvironment environment)
@@ -719,7 +799,7 @@ internal sealed partial class LoaderInstallerArtifactService
     private static string ResolveLibraryPath(string minecraftDirectory, string relativePath)
     {
         if (!IsSafeRelativePath(relativePath))
-            throw new InvalidDataException($"Unsafe Forge library path: {relativePath}");
+            throw SafeExceptionLog.Describe(new InvalidDataException($"Unsafe Forge library path: {relativePath}"), "UnsafeLibraryPath", ("Artifact", relativePath));
         var root = Path.Combine(minecraftDirectory, "libraries");
         var path = MinecraftPathGuard.EnsureWithin(
             Path.Combine(root, relativePath.Replace('/', Path.DirectorySeparatorChar)),

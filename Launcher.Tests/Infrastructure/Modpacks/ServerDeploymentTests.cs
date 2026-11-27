@@ -19,6 +19,55 @@ namespace Launcher.Tests.Infrastructure.Modpacks;
 
 public sealed class ServerDeploymentTests : TestTempDirectory
 {
+    private const string ServerMappingsUrl = "https://piston-data.mojang.com/v1/objects/test/server.txt";
+    private const string RuntimeLibraryUrl = "https://libraries.minecraft.net/com/example/runtime/1.0/runtime-1.0.jar";
+    private const string RuntimeLibraryPath = "com/example/runtime/1.0/runtime-1.0.jar";
+
+    [Fact]
+    public async Task FabricServerProfileUsesMirrorAndCancelsSlowOfficialLookup()
+    {
+        var bytes = "server"u8.ToArray();
+        using var handler = new ProfileServerRuntimeHandler(new ServerRuntimeHandler(bytes, Convert.ToHexString(SHA1.HashData(bytes))));
+        using var client = new HttpClient(handler);
+        var installer = new ServerRuntimeInstaller(client, new FixedSettingsService());
+        var target = Path.Combine(TempRoot, "fabric-server");
+        await installer.InstallAsync(new PreparedModpack
+        {
+            Environment = ModpackInstallEnvironment.Server,
+            MinecraftVersion = "1.20.1",
+            Loader = LoaderKind.Fabric,
+            LoaderVersion = "0.19.3"
+        }, target).WaitAsync(TimeSpan.FromSeconds(10));
+        await handler.Canceled.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.True(File.Exists(Path.Combine(target, "fabric-server-launch.jar")));
+        Assert.True(File.Exists(Path.Combine(target, "fabric-server-launcher.properties")));
+    }
+
+    private sealed class ProfileServerRuntimeHandler(HttpMessageHandler inner) : DelegatingHandler(inner)
+    {
+        private readonly TaskCompletionSource started = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource Canceled { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken token)
+        {
+            if (!request.RequestUri!.AbsolutePath.EndsWith("/server/json", StringComparison.Ordinal))
+                return await base.SendAsync(request, token);
+            if (request.RequestUri.Host == "meta.fabricmc.net")
+            {
+                started.TrySetResult();
+                try { await Task.Delay(Timeout.InfiniteTimeSpan, token); }
+                catch (OperationCanceledException) { Canceled.TrySetResult(); throw; }
+            }
+            Assert.Equal("bmclapi2.bangbang93.com", request.RequestUri.Host);
+            await started.Task.WaitAsync(token);
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                RequestMessage = request,
+                Content = new StringContent("{\"mainClass\":\"net.fabricmc.loader.impl.launch.knot.KnotServer\",\"libraries\":[]}")
+            };
+        }
+    }
+
     [Fact]
     public async Task TransactionCommitsAtomicallyAndRejectsExistingDirectory()
     {
@@ -98,6 +147,39 @@ public sealed class ServerDeploymentTests : TestTempDirectory
         Assert.Contains(handler.RequestedUrls, url => url.EndsWith("-installer.jar.sha1", StringComparison.Ordinal));
     }
 
+    [Theory]
+    [InlineData("{LIBRARY_DIR}/net/minecraft/server/{MINECRAFT_VERSION}/server.jar", true)]
+    [InlineData("{ROOT}/../escaped.jar", false)]
+    public async Task ForgeLikeRuntimePreparesInstallerInputsBeforeRunningJava(string jarPath, bool safe)
+    {
+        var target = Path.Combine(TempRoot, "forge-prepared");
+        var handler = new ForgeServerRuntimeHandler(CreateForgeServerInstaller(jarPath));
+        var runner = new ScriptedForgeServerInstallerRunner(directory =>
+        {
+            Assert.Equal("server-jar", File.ReadAllText(Path.Combine(directory, "libraries/net/minecraft/server/1.20.1/server.jar")));
+            Assert.Equal("server mappings", File.ReadAllText(Path.Combine(directory, "libraries/net/minecraft/server/1.20.1/server-1.20.1-mappings.txt")));
+            Assert.Equal("runtime library", File.ReadAllText(Path.Combine(directory, "libraries", RuntimeLibraryPath)));
+            WriteModernForgeServerEntrypoint(directory, writeProcessorOutput: true);
+        });
+        using var client = new HttpClient(handler);
+        var installer = new ServerRuntimeInstaller(client, new FixedSettingsService(), new FixedLoaderJavaRuntimeResolver(), runner);
+
+        if (!safe)
+        {
+            await Assert.ThrowsAsync<InvalidDataException>(() => installer.InstallAsync(CreateForgeServerModpack(), target));
+            Assert.False(runner.WasRun);
+            Assert.False(File.Exists(Path.Combine(TempRoot, "escaped.jar")));
+            return;
+        }
+
+        await installer.InstallAsync(CreateForgeServerModpack(), target);
+        Assert.True(runner.WasRun);
+        Assert.True(runner.UsedPreparedInstaller);
+        Assert.Single(handler.RequestedUrls.Where(url => url.EndsWith("/server.jar", StringComparison.Ordinal)));
+        Assert.Single(handler.RequestedUrls.Where(url => url == ServerMappingsUrl));
+        Assert.Single(handler.RequestedUrls.Where(url => url == RuntimeLibraryUrl));
+    }
+
     [Fact]
     public async Task ForgeLikeRuntimeInstallsValidArchiveWithoutChecksumMetadata()
     {
@@ -161,12 +243,12 @@ public sealed class ServerDeploymentTests : TestTempDirectory
         LoaderVersion = "1.20.1-47.2.0"
     };
 
-    private static byte[] CreateForgeServerInstaller()
+    private static byte[] CreateForgeServerInstaller(string? serverJarPath = null)
     {
         using var stream = new MemoryStream();
         using (var archive = new ZipArchive(stream, ZipArchiveMode.Create, leaveOpen: true))
         {
-            AddEntry(archive, "install_profile.json", """
+            var profile = JsonNode.Parse("""
                 {
                   "spec": 1,
                   "minecraft": "1.20.1",
@@ -184,8 +266,38 @@ public sealed class ServerDeploymentTests : TestTempDirectory
                     }
                   ]
                 }
-                """);
-            AddEntry(archive, "version.json", """{ "libraries": [] }""");
+                """)!.AsObject();
+            if (serverJarPath is not null)
+            {
+                profile["serverJarPath"] = serverJarPath;
+                profile["processors"]!.AsArray().Insert(0, JsonNode.Parse("""
+                    {
+                      "sides": ["server"],
+                      "jar": "net.minecraftforge:installertools:1.0",
+                      "args": ["--task", "DOWNLOAD_MOJMAPS", "--version", "{MINECRAFT_VERSION}", "--side", "server", "--output", "[net.minecraft:server:1.20.1:mappings@txt]"]
+                    }
+                    """));
+                AddEntry(archive, "META-INF/MANIFEST.MF", "Manifest-Version: 1.0\r\nMain-Class: example.Installer\r\n\r\n");
+                AddEntry(archive, "maven/net/minecraftforge/installertools/1.0/installertools-1.0.jar", "mapping processor");
+            }
+            AddEntry(archive, "install_profile.json", profile.ToJsonString());
+            var runtimeMetadata = new JsonObject { ["libraries"] = new JsonArray() };
+            if (serverJarPath is not null)
+            {
+                runtimeMetadata["libraries"]!.AsArray().Add(new JsonObject
+                {
+                    ["name"] = "com.example:runtime:1.0",
+                    ["downloads"] = new JsonObject
+                    {
+                        ["artifact"] = new JsonObject
+                        {
+                            ["path"] = RuntimeLibraryPath, ["url"] = RuntimeLibraryUrl,
+                            ["sha1"] = Convert.ToHexString(SHA1.HashData("runtime library"u8)), ["size"] = 15
+                        }
+                    }
+                });
+            }
+            AddEntry(archive, "version.json", runtimeMetadata.ToJsonString());
             AddEntry(archive, "maven/com/example/processor/1.0/processor-1.0.jar", "processor");
         }
         return stream.ToArray();
@@ -229,7 +341,8 @@ public sealed class ServerDeploymentTests : TestTempDirectory
             "1.0",
             "server-output-1.0.jar");
         Directory.CreateDirectory(Path.GetDirectoryName(output)!);
-        File.WriteAllText(output, "generated");
+        using var outputArchive = ZipFile.Open(output, ZipArchiveMode.Create);
+        AddEntry(outputArchive, "generated.txt", "generated");
     }
 
     private static void WriteTestJar(string path)
@@ -263,6 +376,8 @@ public sealed class ServerDeploymentTests : TestTempDirectory
             CancellationToken cancellationToken)
         {
             var url = request.RequestUri!.AbsoluteUri;
+            if (IsMissingMirrorMetadata(request.RequestUri))
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound) { RequestMessage = request });
             HttpContent content = url switch
             {
                 "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json" => new StringContent(
@@ -325,23 +440,25 @@ public sealed class ServerDeploymentTests : TestTempDirectory
     private sealed class ScriptedForgeServerInstallerRunner(Action<string> install) : IForgeInstallerRunner
     {
         public bool WasRun { get; private set; }
+        public bool UsedPreparedInstaller { get; private set; }
 
-        public Task RunInstallerAsync(
+        public Task<InstallerProcessResult?> RunInstallerAsync(
             string javaExecutablePath,
             string installerJarPath,
             string minecraftDirectory,
             CancellationToken cancellationToken) =>
             throw new NotSupportedException();
 
-        public Task RunServerInstallerAsync(
+        public Task<InstallerProcessResult?> RunServerInstallerAsync(
             string javaExecutablePath,
             string installerJarPath,
             string serverDirectory,
             CancellationToken cancellationToken)
         {
             WasRun = true;
+            UsedPreparedInstaller = Path.GetFileName(installerJarPath).Contains(".bhl-managed-", StringComparison.Ordinal);
             install(serverDirectory);
-            return Task.CompletedTask;
+            return Task.FromResult<InstallerProcessResult?>(null);
         }
     }
 
@@ -354,14 +471,16 @@ public sealed class ServerDeploymentTests : TestTempDirectory
         private readonly string installerSha1 = Convert.ToHexString(SHA1.HashData(installerBytes)).ToLowerInvariant();
         private readonly string serverSha1 = Convert.ToHexString(SHA1.HashData(ServerBytes)).ToLowerInvariant();
 
-        public List<string> RequestedUrls { get; } = [];
+        public System.Collections.Concurrent.ConcurrentQueue<string> RequestedUrls { get; } = new();
 
         protected override Task<HttpResponseMessage> SendAsync(
             HttpRequestMessage request,
             CancellationToken cancellationToken)
         {
             var url = request.RequestUri!.AbsoluteUri;
-            RequestedUrls.Add(url);
+            RequestedUrls.Enqueue(url);
+            if (IsMissingMirrorMetadata(request.RequestUri))
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound) { RequestMessage = request });
             if (checksumUnavailable
                 && url.EndsWith("-installer.jar.sha1", StringComparison.Ordinal))
             {
@@ -371,29 +490,39 @@ public sealed class ServerDeploymentTests : TestTempDirectory
                 });
             }
 
+            var metadata = JsonSerializer.Serialize(new
+            {
+                id = "1.20.1",
+                releaseTime = "2023-06-12T13:25:51+00:00",
+                downloads = new
+                {
+                    server = new
+                    {
+                        url = "https://piston-data.mojang.com/v1/objects/test/server.jar",
+                        sha1 = serverSha1,
+                        size = ServerBytes.Length
+                    },
+                    server_mappings = new
+                    {
+                        url = ServerMappingsUrl,
+                        sha1 = Convert.ToHexString(SHA1.HashData("server mappings"u8)),
+                        size = 15
+                    }
+                }
+            });
             HttpContent content = url switch
             {
                 "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json" => new StringContent(
-                    """{"versions":[{"id":"1.20.1","url":"https://piston-meta.mojang.com/v1/packages/test/1.20.1.json"}]}""",
+                    $$"""{"versions":[{"id":"1.20.1","url":"https://piston-meta.mojang.com/v1/packages/test/1.20.1.json","sha1":"{{Convert.ToHexString(SHA1.HashData(Encoding.UTF8.GetBytes(metadata)))}}"}]}""",
                     Encoding.UTF8,
                     "application/json"),
                 "https://piston-meta.mojang.com/v1/packages/test/1.20.1.json" => new StringContent(
-                    JsonSerializer.Serialize(new
-                    {
-                        releaseTime = "2023-06-12T13:25:51+00:00",
-                        downloads = new
-                        {
-                            server = new
-                            {
-                                url = "https://piston-data.mojang.com/v1/objects/test/server.jar",
-                                sha1 = serverSha1,
-                                size = ServerBytes.Length
-                            }
-                        }
-                    }),
+                    metadata,
                     Encoding.UTF8,
                     "application/json"),
                 "https://piston-data.mojang.com/v1/objects/test/server.jar" => new ByteArrayContent(ServerBytes),
+                ServerMappingsUrl => new ByteArrayContent("server mappings"u8.ToArray()),
+                RuntimeLibraryUrl => new ByteArrayContent("runtime library"u8.ToArray()),
                 "https://maven.minecraftforge.net/net/minecraftforge/forge/1.20.1-47.2.0/forge-1.20.1-47.2.0-installer.jar.sha1" => new StringContent(checksumOverride ?? installerSha1),
                 "https://maven.minecraftforge.net/net/minecraftforge/forge/1.20.1-47.2.0/forge-1.20.1-47.2.0-installer.jar" => new ByteArrayContent(installerBytes),
                 _ => throw new InvalidOperationException($"Unexpected request: {url}")
@@ -405,4 +534,8 @@ public sealed class ServerDeploymentTests : TestTempDirectory
             });
         }
     }
+
+    private static bool IsMissingMirrorMetadata(Uri uri) => uri.Host == "bmclapi2.bangbang93.com"
+        && (uri.AbsolutePath == "/mc/game/version_manifest_v2.json"
+            || uri.AbsolutePath.StartsWith("/v1/packages/test/", StringComparison.Ordinal));
 }

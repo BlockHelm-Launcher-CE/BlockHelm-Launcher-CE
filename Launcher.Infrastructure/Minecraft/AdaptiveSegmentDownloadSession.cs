@@ -4,6 +4,8 @@
  * SPDX-License-Identifier: GPL-3.0-only
  */
 
+using Launcher.Application.Services;
+
 namespace Launcher.Infrastructure.Minecraft;
 
 internal sealed class AdaptiveSegmentDownloadSession
@@ -83,6 +85,13 @@ internal sealed class AdaptiveSegmentDownloadSession
         }
     }
 
+    public void TrackProbe(AdaptiveDownloadSegment probe)
+    {
+        ArgumentNullException.ThrowIfNull(probe);
+        lock (syncRoot)
+            active.Add(probe);
+    }
+
     public bool TryTakeQueuedOrSplit(
         out AdaptiveDownloadSegment? segment,
         out AdaptiveSegmentSplit? split)
@@ -125,7 +134,7 @@ internal sealed class AdaptiveSegmentDownloadSession
             if (!active.Remove(segment))
                 return;
             if (!segment.IsComplete)
-                throw new InvalidOperationException("An incomplete segmented range cannot be completed.");
+                throw SafeExceptionLog.Describe(new InvalidOperationException("An incomplete segmented range cannot be completed."), "DownloadValidation", ("Reason", "An incomplete segmented range cannot be completed."));
             completedChunks++;
         }
     }
@@ -150,6 +159,7 @@ internal sealed class AdaptiveSegmentDownloadSession
         AdaptiveDownloadSegment? largest = null;
         var largestRemaining = 0L;
         var sourceWasActive = false;
+        var preferred = false;
 
         foreach (var candidate in queued)
         {
@@ -164,11 +174,17 @@ internal sealed class AdaptiveSegmentDownloadSession
         foreach (var candidate in active)
         {
             var remaining = candidate.RemainingLength;
-            if (remaining <= largestRemaining)
+            // The initial range is eligible only after its own slow-read window
+            // requests a split; other ranges retain the usual eager scheduling.
+            if (candidate.ChunkId == 0 && !candidate.PreferSplit)
+                continue;
+            var candidatePreferred = remaining >= splitThreshold && candidate.PreferSplit;
+            if (preferred && !candidatePreferred || candidatePreferred == preferred && remaining <= largestRemaining)
                 continue;
             largest = candidate;
             largestRemaining = remaining;
             sourceWasActive = true;
+            preferred = candidatePreferred;
         }
 
         if (largest is null
@@ -221,6 +237,7 @@ internal sealed class AdaptiveDownloadSegment
     private long logicalEnd;
     private long nextOffset;
     private bool shortened;
+    private bool preferSplit;
 
     public AdaptiveDownloadSegment(int chunkId, long start, long end, long totalLength)
     {
@@ -262,6 +279,26 @@ internal sealed class AdaptiveDownloadSegment
         }
     }
 
+    public bool PreferSplit
+    {
+        get
+        {
+            lock (syncRoot)
+                return preferSplit;
+        }
+    }
+
+    public bool TryPreferSplitting(long minimumRemaining)
+    {
+        lock (syncRoot)
+        {
+            if (logicalEnd - nextOffset + 1 < minimumRemaining)
+                return false;
+            preferSplit = true;
+            return true;
+        }
+    }
+
     public bool IsComplete
     {
         get
@@ -293,7 +330,7 @@ internal sealed class AdaptiveDownloadSegment
         lock (syncRoot)
         {
             if (offset != nextOffset)
-                throw new InvalidOperationException("The segmented write cursor did not match the adaptive range cursor.");
+                throw SafeExceptionLog.Describe(new InvalidOperationException("The segmented write cursor did not match the adaptive range cursor."), "DownloadValidation", ("Reason", "The segmented write cursor did not match the adaptive range cursor."));
             if (offset > logicalEnd || availableBytes == 0)
                 return 0;
 
@@ -336,6 +373,7 @@ internal sealed class AdaptiveDownloadSegment
             retainedEnd = splitStart - 1;
             logicalEnd = retainedEnd;
             shortened = true;
+            preferSplit = false;
             suffix = new AdaptiveDownloadSegment(
                 suffixChunkId,
                 splitStart,

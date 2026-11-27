@@ -33,12 +33,20 @@ internal static class MinecraftDownloadSourceResolver
     private static readonly Regex BmclForgeIndexPathRegex = new(
         @"^/forge/minecraft/(?<version>[^/]+)$",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex NeoForgeInstallerPathRegex = new(
+        @"^/releases/net/neoforged/neoforge/(?<version>[^/]+)/neoforge-\k<version>-installer\.jar$",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
+    private static readonly Regex BmclNeoForgeInstallerPathRegex = new(
+        @"^/neoforge/version/(?<version>[^/]+)/download/installer\.jar$",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
 
     public static IEnumerable<ResolvedDownloadRequest> EnumerateRequests(
         string originalUrl,
         DownloadSourcePreference preference,
         string? categoryHint = null)
     {
+        if (preference is DownloadSourcePreference.Auto)
+            throw new ArgumentException("Automatic preference must be resolved before URL conversion.", nameof(preference));
         var useBmclApiFirst = preference is DownloadSourcePreference.BmclApi;
         var primary = ResolveRequest(originalUrl, preference, useBmclApi: useBmclApiFirst, categoryHint);
         yield return primary;
@@ -56,6 +64,8 @@ internal static class MinecraftDownloadSourceResolver
         bool useBmclApi,
         string? categoryHint = null)
     {
+        if (preference is DownloadSourcePreference.Auto)
+            throw new ArgumentException("Automatic preference must be resolved before URL conversion.", nameof(preference));
         if (!Uri.TryCreate(originalUrl, UriKind.Absolute, out var originalUri))
             throw new InvalidOperationException($"Invalid download URL: {originalUrl}");
 
@@ -254,6 +264,13 @@ internal static class MinecraftDownloadSourceResolver
         if (!uri.Host.Equals(BmclApiHost, StringComparison.OrdinalIgnoreCase))
             return uri.AbsoluteUri;
 
+        var installer = BmclNeoForgeInstallerPathRegex.Match(uri.AbsolutePath);
+        if (installer.Success)
+        {
+            var version = installer.Groups["version"].Value;
+            return $"https://maven.neoforged.net/releases/net/neoforged/neoforge/{version}/neoforge-{version}-installer.jar{uri.Query}";
+        }
+
         if (uri.AbsolutePath.StartsWith("/maven/releases/", StringComparison.OrdinalIgnoreCase))
             return $"https://maven.neoforged.net{uri.AbsolutePath["/maven".Length..]}{uri.Query}";
 
@@ -273,6 +290,13 @@ internal static class MinecraftDownloadSourceResolver
     {
         if (uri.Host.Equals(BmclApiHost, StringComparison.OrdinalIgnoreCase))
             return uri.AbsoluteUri;
+
+        if (uri.Host.Equals("maven.neoforged.net", StringComparison.OrdinalIgnoreCase))
+        {
+            var installer = NeoForgeInstallerPathRegex.Match(uri.AbsolutePath);
+            if (installer.Success)
+                return $"https://{BmclApiHost}/neoforge/version/{installer.Groups["version"].Value}/download/installer.jar{uri.Query}";
+        }
 
         if (uri.AbsolutePath.StartsWith("/releases/", StringComparison.OrdinalIgnoreCase))
             return $"https://{BmclApiHost}/maven{uri.AbsolutePath["/releases".Length..]}{uri.Query}";

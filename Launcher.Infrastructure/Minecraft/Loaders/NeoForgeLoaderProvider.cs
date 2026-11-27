@@ -72,9 +72,9 @@ public sealed class NeoForgeLoaderProvider : ILoaderProvider, IStagedLoaderProvi
         ILoaderInstallerJavaRuntimeResolver? javaRuntimeResolver = null)
     {
         this.httpClient = LauncherHttpUserAgent.Apply(
-            httpClient ?? MinecraftHttpClientFactory.CreateTransportClient());
-        this.installerRunner = installerRunner ?? new ForgeInstallerRunner();
-        this.finalVersionInstaller = finalVersionInstaller ?? new FinalVersionInstaller();
+            httpClient ?? MinecraftHttpClientFactory.CreateTransportClient(logger: logger, connectionPurpose: "NeoForgeShared"));
+        this.installerRunner = installerRunner ?? new ForgeInstallerRunner(logger);
+        this.finalVersionInstaller = finalVersionInstaller ?? new FinalVersionInstaller(logger, downloadSpeedLimitState, this.httpClient);
         this.javaRuntimeResolver = javaRuntimeResolver;
         this.downloadSpeedLimitState = downloadSpeedLimitState;
         this.logger = logger ?? NullLogger.Instance;
@@ -92,7 +92,8 @@ public sealed class NeoForgeLoaderProvider : ILoaderProvider, IStagedLoaderProvi
         string minecraftVersion,
         DownloadSourcePreference downloadSourcePreference = LauncherDefaults.DefaultDownloadSourcePreference,
         CancellationToken cancellationToken = default,
-        int downloadSpeedLimitMbPerSecond = 0)
+        int downloadSpeedLimitMbPerSecond = 0,
+        bool interactive = false)
     {
         if (!NeoForgeArtifactResolver.TryResolveCatalog(minecraftVersion, out var catalog))
         {
@@ -111,7 +112,7 @@ public sealed class NeoForgeLoaderProvider : ILoaderProvider, IStagedLoaderProvi
             httpClient,
             logger,
             DownloadBandwidthLimiter.Create(downloadSpeedLimitMbPerSecond, downloadSpeedLimitState),
-            category: DownloadConcurrencyCategory.Metadata);
+            category: interactive ? DownloadConcurrencyCategory.InteractiveVersionCatalog : DownloadConcurrencyCategory.Metadata);
         var result = await executor.ExecuteStaggeredLookupAsync(
             catalog.MetadataUrl,
             downloadSourcePreference,
@@ -123,8 +124,7 @@ public sealed class NeoForgeLoaderProvider : ILoaderProvider, IStagedLoaderProvi
                 if (document.Root?.Name.LocalName is not "metadata"
                     || document.Descendants("versions").FirstOrDefault() is null)
                 {
-                    throw new DownloadContentValidationException(
-                        "NeoForge Maven metadata has an invalid structure.");
+                    throw SafeExceptionLog.Describe(new DownloadContentValidationException("NeoForge Maven metadata has an invalid structure."), "DownloadContentValidationException", ("Reason", "NeoForge Maven metadata has an invalid structure."));
                 }
 
                 var versions = document.Descendants("version")
@@ -213,6 +213,13 @@ public sealed class NeoForgeLoaderProvider : ILoaderProvider, IStagedLoaderProvi
         CancellationToken cancellationToken,
         int downloadSpeedLimitMbPerSecond)
     {
+        using var operation = DownloadDiagnostics.BeginOperation(logger, "LoaderInstall");
+        using var installationContext = logger.BeginScope(new Dictionary<string, object?>
+        {
+            ["MinecraftVersion"] = minecraftVersion, ["LoaderVersion"] = loaderVersion,
+            ["DownloadSourcePreference"] = downloadSourcePreference,
+            ["DownloadSpeedLimitMbPerSecond"] = downloadSpeedLimitMbPerSecond
+        });
         progress?.Report(new LauncherProgress(InstallProgressStages.Preparing, string.Empty));
 
         var selectedLoaderVersion = loaderVersion;
@@ -250,20 +257,11 @@ public sealed class NeoForgeLoaderProvider : ILoaderProvider, IStagedLoaderProvi
             sharedMinecraftDirectory);
         using var downloadOperation = VanillaLoaderProvider.CreateDownloadOperationContext(installPathLayout.Path);
         Directory.CreateDirectory(installerSessionDirectory);
+        InstallerProcessResult? installerOutput = null;
 
         try
         {
             LoaderVersionDirectoryTransaction.EnsureLauncherProfileExists(installerMinecraftDirectory);
-
-            progress?.Report(new LauncherProgress(InstallProgressStages.DownloadingLoaderInstaller, string.Empty));
-            await DownloadInstallerAsync(
-                installerArtifact,
-                installerJarPath,
-                minecraftVersion,
-                downloadSourcePreference,
-                cancellationToken,
-                downloadSpeedLimitMbPerSecond,
-                speedMeter);
 
             var installerArtifactService = new LoaderInstallerArtifactService(
                 httpClient,
@@ -272,105 +270,68 @@ public sealed class NeoForgeLoaderProvider : ILoaderProvider, IStagedLoaderProvi
                 downloadSpeedLimitState,
                 logger,
                 tempRootDirectory);
-            var installerPlan = await installerArtifactService.ReadPlanAsync(installerJarPath, cancellationToken)
-                .ConfigureAwait(false);
+            var prerequisiteSeeder = new LoaderInstallerPrerequisiteSeeder(httpClient, downloadSpeedLimitState, logger);
+            var (workspaceSnapshot, installerPlan) = await installerArtifactService.PrepareAndRunClientInstallerAsync(
+                installPathLayout, minecraftVersion, installerJarPath, "NeoForge",
+                token => DownloadInstallerAsync(installerArtifact, installerJarPath, minecraftVersion,
+                    downloadSourcePreference, token, downloadSpeedLimitMbPerSecond, speedMeter),
+                async (installer, token) =>
+                {
+                    progress?.Report(new LauncherProgress(InstallProgressStages.CheckingJava, string.Empty));
+                    var resolver = javaRuntimeResolver
+                        ?? throw SafeExceptionLog.Describe(new InvalidOperationException("The loader installer Java runtime resolver is not configured."), "InstallerMetadata", ("Reason", "The loader installer Java runtime resolver is not configured."));
+                    var javaRuntime = await resolver.ResolveAsync(new LoaderInstallerJavaRuntimeRequest(
+                        minecraftVersion, isolatedVersionName, LoaderKind.NeoForge, selectedLoaderVersion,
+                        sharedMinecraftDirectory, downloadSourcePreference, downloadSpeedLimitMbPerSecond, progress),
+                        token).ConfigureAwait(false);
+                    progress?.Report(new LauncherProgress(InstallProgressStages.RunningLoaderInstaller, string.Empty));
+                    installerOutput = await DownloadDiagnostics.RunStageAsync(logger, "JavaInstallerProcess", () => installerRunner.RunInstallerAsync(
+                        javaRuntime.ExecutablePath, installer.ExecutionInstallerPath, installerMinecraftDirectory, token))
+                        .ConfigureAwait(false);
+                },
+                prerequisiteSeeder, finalVersionInstaller, downloadSourcePreference, downloadSpeedLimitMbPerSecond,
+                downloadOperation, progress, speedMeter, cancellationToken).ConfigureAwait(false);
 
-            var prerequisiteSeeder = new LoaderInstallerPrerequisiteSeeder(
-                httpClient,
-                downloadSpeedLimitState,
-                logger);
-            var workspaceSnapshot = await prerequisiteSeeder.SeedAsync(
-                sharedMinecraftDirectory,
-                installerMinecraftDirectory,
-                minecraftVersion,
-                installerJarPath,
-                downloadSourcePreference,
-                downloadSpeedLimitMbPerSecond,
-                cancellationToken,
-                loaderCategory: "NeoForge").ConfigureAwait(false);
-            await installerArtifactService.MaterializePrerequisitesAsync(
-                installerJarPath,
-                installerPlan,
-                installerMinecraftDirectory,
-                downloadSourcePreference,
-                downloadSpeedLimitMbPerSecond,
-                cancellationToken,
-                downloadOperation,
-                speedMeter).ConfigureAwait(false);
-
-            progress?.Report(new LauncherProgress(InstallProgressStages.CheckingJava, string.Empty));
-            var resolver = javaRuntimeResolver
-                ?? throw new InvalidOperationException("The loader installer Java runtime resolver is not configured.");
-            var javaRuntime = await resolver
-                .ResolveAsync(
-                    new LoaderInstallerJavaRuntimeRequest(
-                        minecraftVersion,
-                        isolatedVersionName,
-                        LoaderKind.NeoForge,
-                        selectedLoaderVersion,
-                        sharedMinecraftDirectory,
-                        downloadSourcePreference,
-                        downloadSpeedLimitMbPerSecond,
-                        progress),
-                    cancellationToken)
-                .ConfigureAwait(false);
-            progress?.Report(new LauncherProgress(InstallProgressStages.RunningLoaderInstaller, string.Empty));
-            await installerRunner.RunInstallerAsync(
-                javaRuntime.ExecutablePath,
-                installerJarPath,
-                installerMinecraftDirectory,
-                cancellationToken);
-
-            await installerArtifactService.MaterializeRuntimeLibrariesAsync(
-                installerJarPath,
-                installerPlan,
-                installerMinecraftDirectory,
-                downloadSourcePreference,
-                downloadSpeedLimitMbPerSecond,
-                cancellationToken,
-                downloadOperation,
-                speedMeter).ConfigureAwait(false);
-
-            await installerArtifactService.ValidatePublishedArtifactsAsync(
+            var sandboxOutputs = await DownloadDiagnostics.RunStageAsync(logger, "ArtifactValidation", () => installerArtifactService.ValidatePublishedArtifactsAsync(
                 installerMinecraftDirectory,
                 installerPlan,
-                cancellationToken).ConfigureAwait(false);
+                cancellationToken)).ConfigureAwait(false);
 
-            var sourceVersionName = FindInstalledSourceVersionName(
+            var sourceVersionName = DownloadDiagnostics.RunStage(logger, "InstalledVersionIdentification", () => FindInstalledSourceVersionName(
                 installerMinecraftDirectory,
                 installerArtifact,
-                existingVersionNames);
+                existingVersionNames, logger));
 
             progress?.Report(new LauncherProgress(InstallProgressStages.FinalizingVersion, string.Empty));
-            var finalVersionName = await CreateFinalVersionAsync(
+            var finalVersionName = await DownloadDiagnostics.RunStageAsync(logger, "VersionFinalization", () => CreateFinalVersionAsync(
                 installerMinecraftDirectory,
                 sourceVersionName,
                 isolatedVersionName,
                 minecraftVersion,
-                cancellationToken);
+                cancellationToken));
 
-            await EnsureFinalVersionIsSelfContainedAsync(
+            await DownloadDiagnostics.RunStageAsync(logger, "VersionValidation", () => EnsureFinalVersionIsSelfContainedAsync(
                 installerMinecraftDirectory,
                 finalVersionName,
                 downloadSourcePreference,
                 cancellationToken,
-                downloadSpeedLimitMbPerSecond);
+                downloadSpeedLimitMbPerSecond));
             await LoaderInstallerArtifactService.ApplyRuntimeLibrariesAsync(
                 Path.Combine(installerMinecraftDirectory, "versions", finalVersionName, $"{finalVersionName}.json"),
                 installerPlan,
                 "neoForgeProcessorArtifacts",
                 cancellationToken).ConfigureAwait(false);
 
-            await prerequisiteSeeder.PublishDeltaAsync(
+            await DownloadDiagnostics.RunStageAsync(logger, "SharedPublication", () => prerequisiteSeeder.PublishDeltaAsync(
                 workspaceSnapshot,
                 sharedMinecraftDirectory,
                 cancellationToken,
                 LoaderInstallerArtifactService.CreateTrustedSharedLibraryExpectations(installerPlan),
                 downloadOperation,
-                LoaderInstallerArtifactService.CreateReplaceableProcessorOutputExpectations(installerPlan)).ConfigureAwait(false);
+                LoaderInstallerArtifactService.CreateReplaceableProcessorOutputExpectations(sandboxOutputs))).ConfigureAwait(false);
 
             progress?.Report(new LauncherProgress(InstallProgressStages.CompletingFiles, string.Empty));
-            await finalVersionInstaller.InstallAsync(
+            await DownloadDiagnostics.RunStageAsync(logger, "FinalContent", () => finalVersionInstaller.InstallAsync(
                 installPathLayout.Path,
                 finalVersionName,
                 downloadOperation,
@@ -378,8 +339,8 @@ public sealed class NeoForgeLoaderProvider : ILoaderProvider, IStagedLoaderProvi
                 progress,
                 cancellationToken,
                 downloadSpeedLimitMbPerSecond,
-                speedMeter);
-            await installerArtifactService.MaterializeRuntimeLibrariesAsync(
+                speedMeter));
+            await DownloadDiagnostics.RunStageAsync(logger, "RuntimeLibraries", () => installerArtifactService.MaterializeRuntimeLibrariesAsync(
                 installerJarPath,
                 installerPlan,
                 sharedMinecraftDirectory,
@@ -387,18 +348,19 @@ public sealed class NeoForgeLoaderProvider : ILoaderProvider, IStagedLoaderProvi
                 downloadSpeedLimitMbPerSecond,
                 cancellationToken,
                 downloadOperation,
-                speedMeter).ConfigureAwait(false);
-            await installerArtifactService.ValidatePublishedArtifactsAsync(
+                speedMeter)).ConfigureAwait(false);
+            var publishedOutputs = await DownloadDiagnostics.RunStageAsync(logger, "ArtifactValidation", () => installerArtifactService.ValidatePublishedArtifactsAsync(
                 sharedMinecraftDirectory,
                 installerPlan,
                 cancellationToken,
-                downloadOperation).ConfigureAwait(false);
+                downloadOperation)).ConfigureAwait(false);
             await LoaderArtifactManifestStore.WriteAsync(
                 Path.Combine(installerMinecraftDirectory, "versions", finalVersionName),
                 sharedMinecraftDirectory,
                 new GameFileLoaderIdentity(LoaderKind.NeoForge, minecraftVersion, selectedLoaderVersion),
                 installerJarPath,
                 installerPlan,
+                publishedOutputs,
                 cancellationToken).ConfigureAwait(false);
 
             LoaderVersionDirectoryTransaction.CopyFinalVersionDirectory(
@@ -406,13 +368,14 @@ public sealed class NeoForgeLoaderProvider : ILoaderProvider, IStagedLoaderProvi
                 gameDirectory,
                 finalVersionName,
                 cancellationToken);
-            await installerArtifactService.ValidatePublishedArtifactsAsync(
+            await DownloadDiagnostics.RunStageAsync(logger, "ArtifactValidation", () => installerArtifactService.ValidatePublishedArtifactsAsync(
                 sharedMinecraftDirectory,
                 installerPlan,
                 cancellationToken,
-                downloadOperation).ConfigureAwait(false);
+                downloadOperation,
+                previouslyInspectedOutputs: publishedOutputs)).ConfigureAwait(false);
 
-            LoaderVersionDirectoryTransaction.CleanupCreatedVersionDirectories(gameDirectory, existingVersionNames, finalVersionName);
+            LoaderVersionDirectoryTransaction.CleanupCreatedVersionDirectories(gameDirectory, existingVersionNames, finalVersionName, logger);
             logger.LogInformation(
                 "NeoForge installation completed. MinecraftVersion={MinecraftVersion} LoaderVersion={LoaderVersion} FinalVersionName={FinalVersionName}",
                 minecraftVersion,
@@ -420,14 +383,16 @@ public sealed class NeoForgeLoaderProvider : ILoaderProvider, IStagedLoaderProvi
                 finalVersionName);
             return finalVersionName;
         }
-        catch
+        catch (Exception exception)
         {
-            LoaderVersionDirectoryTransaction.CleanupCreatedVersionDirectories(gameDirectory, existingVersionNames, preserveVersionName: null);
+            logger.LogError(exception, "Loader installation failed before cleanup. MinecraftVersion={MinecraftVersion} LoaderVersion={LoaderVersion}", minecraftVersion, selectedLoaderVersion);
+            installerOutput?.LogAfterFailure(logger);
+            LoaderVersionDirectoryTransaction.CleanupCreatedVersionDirectories(gameDirectory, existingVersionNames, preserveVersionName: null, logger);
             throw;
         }
         finally
         {
-            LoaderVersionDirectoryTransaction.TryDeleteDirectory(installerSessionDirectory);
+            LoaderVersionDirectoryTransaction.TryDeleteDirectory(installerSessionDirectory, logger);
         }
     }
 
@@ -461,6 +426,7 @@ public sealed class NeoForgeLoaderProvider : ILoaderProvider, IStagedLoaderProvi
             Path.GetFileName(destinationPath),
             destinationPath,
             sourceUrl);
+        using var diagnosticLogScope = logScope.RestoreContext();
         try
         {
             var resolution = await executor.DownloadFileAsync(
@@ -541,11 +507,11 @@ public sealed class NeoForgeLoaderProvider : ILoaderProvider, IStagedLoaderProvi
     private static string FindInstalledSourceVersionName(
         string gameDirectory,
         NeoForgeInstallerArtifact artifact,
-        HashSet<string> existingVersionNames)
+        HashSet<string> existingVersionNames, ILogger? diagnosticLogger = null)
     {
         var versionsDirectory = Path.Combine(gameDirectory, "versions");
         if (!Directory.Exists(versionsDirectory))
-            throw new InvalidOperationException("NeoForge installation did not create a version directory.");
+            throw SafeExceptionLog.Describe(new InvalidOperationException("NeoForge installation did not create a version directory."), "InstallerMetadata", ("Reason", "NeoForge installation did not create a version directory."));
 
         var candidates = Directory.GetDirectories(versionsDirectory)
             .Select(directory => new DirectoryInfo(directory))
@@ -555,23 +521,22 @@ public sealed class NeoForgeLoaderProvider : ILoaderProvider, IStagedLoaderProvi
         // 安装器输出名称会随版本变化，先限定新目录，再按库坐标和版本身份验证候选。
         var sourceVersion = candidates
             .Where(directory => !existingVersionNames.Contains(directory.Name))
-            .Select(directory => TryCreateSourceMatch(directory.FullName, directory.Name, artifact))
+            .Select(directory => TryCreateSourceMatch(directory.FullName, directory.Name, artifact, diagnosticLogger))
             .FirstOrDefault(match => match is not null)
             ?? candidates
-                .Select(directory => TryCreateSourceMatch(directory.FullName, directory.Name, artifact))
+                .Select(directory => TryCreateSourceMatch(directory.FullName, directory.Name, artifact, diagnosticLogger))
                 .FirstOrDefault(match => match is not null);
 
         return sourceVersion?.VersionName
-            ?? throw new InvalidOperationException(
-                $"NeoForge installer did not produce a usable version for {artifact.LoaderVersion}.");
+            ?? throw SafeExceptionLog.Describe(new InvalidOperationException($"NeoForge installer did not produce a usable version for {artifact.LoaderVersion}."), "InstalledVersionNotFound", ("LoaderVersion", artifact.LoaderVersion), ("ExpectedVersionId", artifact.ExpectedVersionId), ("CandidateVersions", candidates.Take(100).Select(item => item.Name).ToArray()));
     }
 
     private static NeoForgeSourceMatch? TryCreateSourceMatch(
         string versionDirectory,
         string versionName,
-        NeoForgeInstallerArtifact artifact)
+        NeoForgeInstallerArtifact artifact, ILogger? diagnosticLogger = null)
     {
-        var metadata = TryReadVersionMetadata(versionDirectory, versionName);
+        var metadata = TryReadVersionMetadata(versionDirectory, versionName, diagnosticLogger);
         if (metadata is null)
             return null;
 
@@ -643,7 +608,7 @@ public sealed class NeoForgeLoaderProvider : ILoaderProvider, IStagedLoaderProvi
         return finalVersionName;
     }
 
-    private static VersionJsonMetadata? TryReadVersionMetadata(string versionDirectory, string versionName)
+    private static VersionJsonMetadata? TryReadVersionMetadata(string versionDirectory, string versionName, ILogger? diagnosticLogger = null)
     {
         var versionJsonPath = Path.Combine(versionDirectory, $"{versionName}.json");
         if (!File.Exists(versionJsonPath))
@@ -660,16 +625,19 @@ public sealed class NeoForgeLoaderProvider : ILoaderProvider, IStagedLoaderProvi
                 GetStringProperty(root, "jar"),
                 ReadLibraryNames(root));
         }
-        catch (JsonException)
+        catch (JsonException exception)
         {
+            diagnosticLogger?.LogWarning(exception, "Installer version metadata could not be read. VersionName={VersionName} Stage=InstalledVersionIdentification", versionName);
             return null;
         }
-        catch (IOException)
+        catch (IOException exception)
         {
+            diagnosticLogger?.LogWarning(exception, "Installer version metadata could not be read. VersionName={VersionName} Stage=InstalledVersionIdentification", versionName);
             return null;
         }
-        catch (UnauthorizedAccessException)
+        catch (UnauthorizedAccessException exception)
         {
+            diagnosticLogger?.LogWarning(exception, "Installer version metadata could not be read. VersionName={VersionName} Stage=InstalledVersionIdentification", versionName);
             return null;
         }
     }
